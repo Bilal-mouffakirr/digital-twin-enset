@@ -106,7 +106,7 @@ with st.sidebar:
           <img 
             src="https://www.startpage.com/av/proxy-image?piurl=https%3A%2F%2Ftse3.mm.bing.net%2Fth%2Fid%2FOIP._SKHTtj-78Un4eybBA2wkQHaHa%3Fpid%3DApi&sp=1775078163Tb6ad58cde3e0278c5d4b1eaa4027f95a6c97fdba104b121d10e96d91ae81b60b"
             alt="sun"
-            style="width:3rem; height:3rem;"
+            style="width:5rem; height:5rem;"
              >
         </div>
         <h2 style="color:#00d1b2; font-size:1.4rem; margin:0;">ENSET Mohammedia</h2>
