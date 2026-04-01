@@ -330,4 +330,4 @@ while True:
     except Exception as e:
         pass
 
-    time.sleep(0.01)
+    time.sleep(0.0001)
