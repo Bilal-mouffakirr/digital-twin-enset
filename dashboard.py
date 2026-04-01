@@ -8,7 +8,7 @@ from io import StringIO
 import warnings
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
-
+time_sleep = 0.001
 # ============================================================
 # 1. إعدادات الواجهة
 # ============================================================
@@ -139,7 +139,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("⚙️ Paramètres")
-    st.caption("Rafraîchissement : 500 ms")
+    st.caption(f"Rafraîchissement : {time_sleep}")
     st.caption("Historique max   : 50 pts")
     if global_data["last_error"]:
         st.warning(f"⚠️ {global_data['last_error']}")
@@ -330,4 +330,4 @@ while True:
     except Exception as e:
         pass
 
-    time.sleep(0.0001)
+    time.sleep(time_sleep)
