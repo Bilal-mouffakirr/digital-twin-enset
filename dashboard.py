@@ -104,7 +104,7 @@ with st.sidebar:
     <div style="text-align:center; padding:20px 0;">
        <div style="font-size:3rem;">
           <img 
-            src="https://www.startpage.com/av/proxy-image?piurl=https%3A%2F%2Ftse3.mm.bing.net%2Fth%2Fid%2FOIP._SKHTtj-78Un4eybBA2wkQHaHa%3Fpid%3DApi&sp=1775078163Tb6ad58cde3e0278c5d4b1eaa4027f95a6c97fdba104b121d10e96d91ae81b60b"
+            src="th.jpg"
             alt="sun"
             style="width:5rem; height:5rem;"
              >
