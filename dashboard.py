@@ -202,7 +202,7 @@ v_rms = float(np.sqrt(np.mean(df['V_inv']**2))) if len(df) > 0 else 0.0
 with r2_c1: st.metric("📈 V_inv RMS",   f"{v_rms:.2f} V")
 with r2_c2: st.metric("🔆 V_PV",        f"{current_vals['V_pv']:.1f} V")
 with r2_c3: st.metric("🎯 Rendement",   f"{eff:.1f} %")
-
+st.markdown(" ") # 
             # ========================================================
             # ROW 2 — Puissance Apparente S + Réactive Q + FP
             # ========================================================
