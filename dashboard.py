@@ -12,7 +12,7 @@ time_sleep = 0.001
 # ============================================================
 # 1. إعدادات الواجهة
 # ============================================================
-st.set_page_config(page_title="Digital Twin PV - ENSET", layout="wide", page_icon="☀️")
+st.set_page_config(page_title="Digital Twin PV - ENSET", layout="wide", page_icon="https://www.startpage.com/av/proxy-image?piurl=https%3A%2F%2Ftse3.mm.bing.net%2Fth%2Fid%2FOIP._SKHTtj-78Un4eybBA2wkQHaHa%3Fpid%3DApi&sp=1775076847Tb1a92041ca968dd0518d99783a819921ac64735d498fc70eabc66865c2ec68be")
 
 st.markdown("""
     <style>
