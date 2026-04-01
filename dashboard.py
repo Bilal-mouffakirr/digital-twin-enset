@@ -186,7 +186,7 @@ while True:
             with c1: st.metric("🌞 P_PV",       f"{current_vals['P_pv']:.1f} W")
             with c2: st.metric("🔋 P_Boost DC",  f"{current_vals['P_dc']:.1f} W")
             with c3: st.metric("🔌 P_Onduleur",  f"{current_vals['P_inv']:.1f} W")
-            with c4: st.metric("📈 V_inv RMS",   f"{v_rms:.2f} V")
+            with c4: st.metric("📈 V_inv RMS",   f"{v_rms:.2f} V\n")
             with c5: st.metric("🔆 V_PV",        f"{current_vals['V_pv']:.1f} V")
             with c6: st.metric("🎯 Rendement",   f"{eff:.1f} %")
 
