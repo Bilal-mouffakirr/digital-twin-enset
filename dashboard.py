@@ -100,31 +100,21 @@ mqtt_service = start_mqtt_service()
 # 5. Sidebar
 # ============================================================
 # تأكد أن الملف th.jpg موجود في نفس المجلد مع ملف python
-img_path = 'th.jpg'
-
-if os.path.exists(img_path):
-    img_base64 = get_base64_of_bin_file(img_path)
-    img_html = f'data:image/jpg;base64,{img_base64}'
-else:
-    # صورة افتراضية في حالة عدم وجود الملف
-    img_html = "https://via.placeholder.com/150" 
-
 with st.sidebar:
-    st.markdown(f"""
-    <div style="text-align:center; padding:20px 0; background-color: #1e1e1e; border-radius: 10px; margin-bottom: 20px;">
-        <div style="display: flex; justify-content: center;">
-            <img src="{img_html}" 
-                 style="width:5rem; height:5rem; border-radius: 50%; border: 2px solid #00d1b2; object-fit: cover;">
+    st.markdown("""
+    <div style="text-align:center; padding:20px 0;">
+       <div style="font-size:3rem;">
+          <img 
+            src="th.jpg"
+            alt="sun"
+            style="width:5rem; height:5rem;"
+             >
         </div>
-        <h2 style="color:#00d1b2; font-size:1.4rem; margin:10px 0 0 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;">
-            ENSET Mohammedia
-        </h2>
-        <p style="color:#aaa; font-size:0.9rem; margin:5px 0;">Digital Twin — PV System</p>
-        <p style="color:#00d1b2; font-size:0.8rem; font-weight: bold;"> 2025/2026 </p>
+        <h2 style="color:#00d1b2; font-size:1.4rem; margin:0;">ENSET Mohammedia</h2>
+        <p style="color:#aaa; font-size:0.8rem; margin:0;">Digital Twin — PV System</p>
+        <p style="color:#00d1b2; font-size:0.75rem; margin-top:8px;"> 2025/2026 </p>
     </div>
-    <hr style="border: 0.5px solid #333;">
     """, unsafe_allow_html=True)
-
     st.markdown("---")
     st.subheader("📡 Connexion MQTT")
     if global_data.get("connected", False):
