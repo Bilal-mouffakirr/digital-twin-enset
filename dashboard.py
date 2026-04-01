@@ -102,7 +102,13 @@ mqtt_service = start_mqtt_service()
 with st.sidebar:
     st.markdown("""
     <div style="text-align:center; padding:20px 0;">
-        <div style="font-size:3rem;">https://www.startpage.com/av/proxy-image?piurl=https%3A%2F%2Ftse3.mm.bing.net%2Fth%2Fid%2FOIP._SKHTtj-78Un4eybBA2wkQHaHa%3Fpid%3DApi&sp=1775076847Tb1a92041ca968dd0518d99783a819921ac64735d498fc70eabc66865c2ec68be</div>
+       <div style="font-size:3rem;">
+          <img 
+            src="https://www.startpage.com/av/proxy-image?piurl=https%3A%2F%2Ftse3.mm.bing.net%2Fth%2Fid%2FOIP._SKHTtj-78Un4eybBA2wkQHaHa%3Fpid%3DApi&sp=1775078163Tb6ad58cde3e0278c5d4b1eaa4027f95a6c97fdba104b121d10e96d91ae81b60b"
+            alt="sun"
+            style="width:3rem; height:3rem;"
+             >
+        </div>
         <h2 style="color:#00d1b2; font-size:1.4rem; margin:0;">ENSET Mohammedia</h2>
         <p style="color:#aaa; font-size:0.8rem; margin:0;">Digital Twin — PV System</p>
         <p style="color:#00d1b2; font-size:0.75rem; margin-top:8px;"> 2025/2026 </p>
