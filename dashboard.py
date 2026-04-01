@@ -177,33 +177,34 @@ while True:
             # ========================================================
             # ROW 1 — Métriques Puissances + Tensions
             # ========================================================
-# ========================================================
-# ROW 1 — (Puissances)
-# ========================================================
-st.subheader("⚡ Puissances — Valeurs instantanées")
-r1_c1, r1_c2, r1_c3 = st.columns(3)
-
-eff = (current_vals['P_inv'] / current_vals['P_pv'] * 100) if current_vals['P_pv'] > 1 else 0.0
-
-with r1_c1: st.metric("🌞 P_PV",       f"{current_vals['P_pv']:.1f} W")
-with r1_c2: st.metric("🔋 P_Boost DC", f"{current_vals['P_dc']:.1f} W")
-with r1_c3: st.metric("🔌 P_Onduleur", f"{current_vals['P_inv']:.1f} W")
-
-st.markdown(" ") # سطر خاوي للتنفس بين الأسطر
-
-# ========================================================
-# ROW 2 — (Tensions & Performance)
-# ========================================================
-st.subheader("📈 Tensions & Performance")
-r2_c1, r2_c2, r2_c3 = st.columns(3)
-
-v_rms = float(np.sqrt(np.mean(df['V_inv']**2))) if len(df) > 0 else 0.0
-
-with r2_c1: st.metric("📈 V_inv RMS",   f"{v_rms:.2f} V")
-with r2_c2: st.metric("🔆 V_PV",        f"{current_vals['V_pv']:.1f} V")
-with r2_c3: st.metric("🎯 Rendement",   f"{eff:.1f} %")
-st.markdown(" ") # 
             # ========================================================
+            # ROW 1 — Les Puissances (3 Columns)
+            # ========================================================
+            st.subheader("⚡ Puissances — Valeurs instantanées")
+            r1_c1, r1_c2, r1_c3 = st.columns(3)
+            
+            # الحسابات (كتبقى هي هي)
+            v_rms = float(np.sqrt(np.mean(df['V_inv']**2))) if len(df) > 0 else 0.0
+            eff   = (current_vals['P_inv'] / current_vals['P_pv'] * 100) if current_vals['P_pv'] > 0 else 0.0
+            
+            with r1_c1: st.metric("🌞 P_PV",       f"{current_vals['P_pv']:.1f} W")
+            with r1_c2: st.metric("🔋 P_Boost DC", f"{current_vals['P_dc']:.1f} W")
+            with r1_c3: st.metric("🔌 P_Onduleur", f"{current_vals['P_inv']:.1f} W")
+            
+            st.markdown(" ") # سطر خاوي خفيف للتنفس
+            
+            # ========================================================
+            # ROW 2 — Tensions & Performance (3 Columns)
+            # ========================================================
+            st.subheader("📈 Tensions & Performance")
+            r2_c1, r2_c2, r2_c3 = st.columns(3)
+            
+            with r2_c1: st.metric("📈 V_inv RMS",   f"{v_rms:.2f} V")
+            with r2_c2: st.metric("🔆 V_PV",        f"{current_vals['V_pv']:.1f} V")
+            with r2_c3: st.metric("🎯 Rendement",   f"{eff:.1f} %")
+            
+            st.markdown("---") # فاصل بين الأرقام والمبيانات
+            #=================================================
             # ROW 2 — Puissance Apparente S + Réactive Q + FP
             # ========================================================
             st.subheader("📐 Puissances Apparente & Réactive")
