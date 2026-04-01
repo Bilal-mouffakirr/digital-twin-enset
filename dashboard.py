@@ -352,6 +352,7 @@ while True:
 
                 st.caption("⭐ = P_MPP théorique\n🔴 = Point réel")
 
-  
+    except Exception as e:
+        pass
 
     time.sleep(0.5)
