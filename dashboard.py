@@ -352,9 +352,6 @@ while True:
 
                 st.caption("⭐ = P_MPP théorique\n🔴 = Point réel")
 
-    except Exception as e:
-        # ← هاد السطر هو لي كيحل مشكلة الـ red crash
-        # بلا ما يوقف، كيعرض رسالة صغيرة وكيكمل
-        st.warning(f"⚠️ Erreur temporaire (auto-reprise): {e}")
+  
 
     time.sleep(0.5)
