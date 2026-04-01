@@ -105,7 +105,7 @@ with st.sidebar:
         <div style="font-size:3rem;">☀️</div>
         <h2 style="color:#00d1b2; font-size:1.4rem; margin:0;">ENSET Mohammedia</h2>
         <p style="color:#aaa; font-size:0.8rem; margin:0;">Digital Twin — PV System</p>
-        <p style="color:#00d1b2; font-size:0.75rem; margin-top:8px;">Bilal · 2025</p>
+        <p style="color:#00d1b2; font-size:0.75rem; margin-top:8px;"> 2025/2026 </p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -139,7 +139,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("⚙️ Paramètres")
-    st.caption(f"Rafraîchissement : {time_sleep}")
+    st.caption(f"Rafraîchissement : {time_sleep} s")
     st.caption("Historique max   : 50 pts")
     if global_data["last_error"]:
         st.warning(f"⚠️ {global_data['last_error']}")
