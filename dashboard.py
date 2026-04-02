@@ -105,7 +105,7 @@ with st.sidebar:
     <div style="text-align:center; padding:20px 0;">
        <div style="font-size:3rem;">
           <img 
-            src="th.jpg"
+            src= th.jpg
             alt="ENSET"
             style="width:9rem; height:9rem;"
              >
