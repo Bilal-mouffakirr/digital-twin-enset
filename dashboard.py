@@ -105,7 +105,7 @@ with st.sidebar:
     <div style="text-align:center; padding:20px 0;">
        <div style="font-size:3rem;">
           <img 
-            src="https://www.startpage.com/av/proxy-image?piurl=https%3A%2F%2Fwww.enset-media.ac.ma%2Fsites%2Fdefault%2Ffiles%2Fenset_mohammedia_0.png&sp=1775147331T43673fb2801f8f6cb650d90d98d227035ab45f095c5cc0d53dfb268470ebe3ad"
+            src="th.jpg"
             alt="ENSET"
             style="width:9rem; height:9rem;"
              >
