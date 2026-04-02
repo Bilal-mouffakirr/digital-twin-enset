@@ -170,7 +170,7 @@ while True:
             # ── Attente données ──────────────────────────────────
             if current_vals["P_pv"] == 0 and current_vals["V_inv"] == 0:
                 st.warning("⏳ En attente de données... Vérifiez votre Gateway.")
-                st.info(f" Topics surveillés sous: `{PREFIX}`")
+                st.info(f"📡Topics surveillés sous: `{PREFIX}`")
                 time.sleep(0.5)
                 continue
 
