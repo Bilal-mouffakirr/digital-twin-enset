@@ -6,6 +6,16 @@ import time
 import plotly.graph_objects as go
 from io import StringIO
 import warnings
+import base64
+
+# دالة لتحويل الصورة المحلية إلى تنسيق يمكن لـ HTML قراءته
+def get_base64_of_bin_file(bin_file):
+    with open(bin_file, 'rb') as f:
+        data = f.read()
+    return base64.b64encode(data).decode()
+
+# تحويل صورتك th.jpg
+img_base64 = get_base64_of_bin_file("th.jpg")
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 time_sleep = 0.001
@@ -101,13 +111,13 @@ mqtt_service = start_mqtt_service()
 # ============================================================
 #  python
 with st.sidebar:
-    st.markdown("""
+    st.markdown(f"""
     <div style="text-align:center; padding:20px 0;">
        <div style="font-size:3rem;">
           <img 
-            src="https://www.startpage.com/av/proxy-image?piurl=https%3A%2F%2Ftse1.mm.bing.net%2Fth%2Fid%2FOIP.szBSW9bW5UAPGYc_sibnQwAAAA%3Fpid%3DApi&sp=1775159661T5a1f34aef5d40fe46875163ab5ce43693bdcf1accc2d03fe81ae54099856bfa0"
+            src="data:image/jpeg;base64,{img_base64}" 
             alt="ENSET"
-            style="width:9rem; height:9rem;"
+            style="width:9rem; height:9rem; border-radius: 50%;"
              >
         </div>
         <h2 style="color:#00d1b2; font-size:1.4rem; margin:0;">ENSET Mohammedia</h2>
