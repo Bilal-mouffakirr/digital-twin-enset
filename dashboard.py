@@ -117,7 +117,7 @@ with st.sidebar:
           <img 
             src="data:image/jpeg;base64,{img_base64}" 
             alt="ENSET"
-            style="width:19rem; height:19rem; border-radius: 30%;"
+            style="width:10rem; height:10rem; border-radius: 50%;"
              >
         </div>
         <h2 style="color:#00d1b2; font-size:1.4rem; margin:0;">ENSET Mohammedia</h2>
