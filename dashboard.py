@@ -10,7 +10,7 @@ import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 time_sleep = 0.001
 # ============================================================
-# 1. إعدادات الواجهة
+# 1. 
 # ============================================================
 st.set_page_config(page_title="Digital Twin PV - ENSET", layout="wide", page_icon="https://www.startpage.com/av/proxy-image?piurl=https%3A%2F%2Ftse3.mm.bing.net%2Fth%2Fid%2FOIP._SKHTtj-78Un4eybBA2wkQHaHa%3Fpid%3DApi&sp=1775076847Tb1a92041ca968dd0518d99783a819921ac64735d498fc70eabc66865c2ec68be")
 
@@ -23,7 +23,7 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # ============================================================
-# 2. إعدادات MQTT — 10 topics
+# 2.  MQTT — 10 topics
 # ============================================================
 PREFIX = "enset/bilal/pv_twin/"
 BROKER = "broker.hivemq.com"
@@ -43,7 +43,7 @@ TOPICS_MAP = {
 FULL_TOPICS = list(TOPICS_MAP.keys())
 
 # ============================================================
-# 3. المخزن العالمي
+# 3. 
 # ============================================================
 @st.cache_resource
 def get_global_store():
@@ -99,7 +99,7 @@ mqtt_service = start_mqtt_service()
 # ============================================================
 # 5. Sidebar
 # ============================================================
-# تأكد أن الملف th.jpg موجود في نفس المجلد مع ملف python
+#  python
 with st.sidebar:
     st.markdown("""
     <div style="text-align:center; padding:20px 0;">
@@ -153,7 +153,7 @@ with st.sidebar:
 # ============================================================
 # 6. Boucle principale
 # ============================================================
-st.title("☀️ Digital Twin ENSET: Cloud Monitoring Pro")
+st.title("Digital Twin ENSET: Cloud Monitoring Pro")
 placeholder = st.empty()
 
 while True:
@@ -170,7 +170,7 @@ while True:
             # ── Attente données ──────────────────────────────────
             if current_vals["P_pv"] == 0 and current_vals["V_inv"] == 0:
                 st.warning("⏳ En attente de données... Vérifiez votre Gateway.")
-                st.info(f"📡 Topics surveillés sous: `{PREFIX}`")
+                st.info(f" Topics surveillés sous: `{PREFIX}`")
                 time.sleep(0.5)
                 continue
 
@@ -187,27 +187,27 @@ while True:
             v_rms = float(np.sqrt(np.mean(df['V_inv']**2))) if len(df) > 0 else 0.0
             eff   = (current_vals['P_inv'] / current_vals['P_pv'] * 100) if current_vals['P_pv'] > 0 else 0.0
             
-            with r1_c1: st.metric("🌞 P_PV",       f"{current_vals['P_pv']:.1f} W")
-            with r1_c2: st.metric("🔋 P_Boost DC", f"{current_vals['P_dc']:.1f} W")
-            with r1_c3: st.metric("🔌 P_Onduleur", f"{current_vals['P_inv']:.1f} W")
+            with r1_c1: st.metric("P_PV",       f"{current_vals['P_pv']:.1f} W")
+            with r1_c2: st.metric("P_Boost DC", f"{current_vals['P_dc']:.1f} W")
+            with r1_c3: st.metric("P_Onduleur", f"{current_vals['P_inv']:.1f} W")
             
             st.markdown(" ") # سطر خاوي خفيف للتنفس
             
             # ========================================================
             # ROW 2 — Tensions & Performance (3 Columns)
             # ========================================================
-            st.subheader("📈 Tensions & Performance")
+            st.subheader("Tensions & Performance")
             r2_c1, r2_c2, r2_c3 = st.columns(3)
             
-            with r2_c1: st.metric("📈 V_inv RMS",   f"{v_rms:.2f} V")
-            with r2_c2: st.metric("🔆 V_PV",        f"{current_vals['V_pv']:.1f} V")
-            with r2_c3: st.metric("🎯 Rendement",   f"{eff:.1f} %")
+            with r2_c1: st.metric("V_inv RMS",   f"{v_rms:.2f} V")
+            with r2_c2: st.metric("V_PV",        f"{current_vals['V_pv']:.1f} V")
+            with r2_c3: st.metric("Rendement",   f"{eff:.1f} %")
             
             st.markdown("---") # فاصل بين الأرقام والمبيانات
             #=================================================
             # ROW 2 — Puissance Apparente S + Réactive Q + FP
             # ========================================================
-            st.subheader("📐 Puissances Apparente & Réactive")
+            st.subheader("Puissances Apparente & Réactive")
             s1, s2, s3, s4 = st.columns(4)
 
             S_val = current_vals['S']
@@ -225,14 +225,14 @@ while True:
             # ========================================================
             # ROW 3 — THD
             # ========================================================
-            st.subheader("🌊 Distorsion Harmonique Totale (THD)")
+            st.subheader("Distorsion Harmonique Totale (THD)")
             t1, t2, t3 = st.columns(3)
 
             thd_v = current_vals['THD_V']
             thd_i = current_vals['THD_I']
 
             with t1:
-                st.metric("📉 THD_V — Tension onduleur", f"{thd_v:.2f} %")
+                st.metric("THD_V — Tension onduleur", f"{thd_v:.2f} %")
                 if thd_v < 5:
                     st.success("✅ < 5% — Conforme IEC")
                 elif thd_v < 8:
@@ -241,7 +241,7 @@ while True:
                     st.error("❌ Hors norme")
 
             with t2:
-                st.metric("📉 THD_I — Courant onduleur", f"{thd_i:.2f} %")
+                st.metric("THD_I — Courant onduleur", f"{thd_i:.2f} %")
                 if thd_i < 5:
                     st.success("✅ < 5% — Conforme IEC")
                 elif thd_i < 8:
@@ -273,7 +273,7 @@ while True:
             # ========================================================
             # ROW 4 — Courbes Puissances (3 courbes séparées)
             # ========================================================
-            st.subheader("📊 Évolution des Puissances Actives")
+            st.subheader("Évolution des Puissances Actives")
             pc1, pc2, pc3 = st.columns(3)
 
             def make_area_chart(y_data, color, fill_color, title):
@@ -293,17 +293,17 @@ while True:
 
             with pc1:
                 st.plotly_chart(
-                    make_area_chart(df['P_pv'],  '#00d1b2', 'rgba(0,209,178,0.15)', '🌞 Puissance PV (W)'),
+                    make_area_chart(df['P_pv'],  '#00d1b2', 'rgba(0,209,178,0.15)', 'Puissance PV (W)'),
                     use_container_width=True, key="chart_p_pv"
                 )
             with pc2:
                 st.plotly_chart(
-                    make_area_chart(df['P_dc'],  '#FFDD57', 'rgba(255,221,87,0.15)', '🔋 Puissance Boost DC (W)'),
+                    make_area_chart(df['P_dc'],  '#FFDD57', 'rgba(255,221,87,0.15)', 'Puissance Boost DC (W)'),
                     use_container_width=True, key="chart_p_dc"
                 )
             with pc3:
                 st.plotly_chart(
-                    make_area_chart(df['P_inv'], '#ff3860', 'rgba(255,56,96,0.15)',  '🔌 Puissance Onduleur AC (W)'),
+                    make_area_chart(df['P_inv'], '#ff3860', 'rgba(255,56,96,0.15)',  'Puissance Onduleur AC (W)'),
                     use_container_width=True, key="chart_p_inv"
                 )
 
@@ -312,7 +312,7 @@ while True:
             # ========================================================
             # ROW 5 — Courbes Tensions (3 courbes séparées)
             # ========================================================
-            st.subheader("⚡ Évolution des Tensions")
+            st.subheader("Évolution des Tensions")
             vc1, vc2, vc3 = st.columns(3)
 
             def make_line_chart(y_data, color, title, y_label="V"):
@@ -331,17 +331,17 @@ while True:
 
             with vc1:
                 st.plotly_chart(
-                    make_line_chart(df['V_pv'], '#00d1b2', '🌞 Tension PV (V)'),
+                    make_line_chart(df['V_pv'], '#00d1b2', 'Tension PV (V)'),
                     use_container_width=True, key="chart_v_pv"
                 )
             with vc2:
                 st.plotly_chart(
-                    make_line_chart(df['V_dc'], '#FFDD57', '🔋 Tension Bus DC (V)'),
+                    make_line_chart(df['V_dc'], '#FFDD57', 'Tension Bus DC (V)'),
                     use_container_width=True, key="chart_v_dc"
                 )
             with vc3:
                 st.plotly_chart(
-                    make_line_chart(df['V_inv'], '#3273DC', '🔌 Tension Onduleur AC (V)'),
+                    make_line_chart(df['V_inv'], '#3273DC', 'Tension Onduleur AC (V)'),
                     use_container_width=True, key="chart_v_ac"
                 )
 
