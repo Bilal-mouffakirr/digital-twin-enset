@@ -105,7 +105,7 @@ with st.sidebar:
     <div style="text-align:center; padding:20px 0;">
        <div style="font-size:3rem;">
           <img 
-            src="https://vector.ma/vectors/a9d7bb12-4e2d-47f8-8482-ca88d1b96991"
+            src="https://api.vector.ma/vectors/thumbnail/1b727269-7554-424d-ba62-54bf223bd611"
             alt="ENSET"
             style="width:9rem; height:9rem;"
              >
@@ -180,7 +180,7 @@ while True:
             # ========================================================
             # ROW 1 — Les Puissances (3 Columns)
             # ========================================================
-            st.subheader("⚡ Puissances — Valeurs instantanées")
+            st.subheader("Puissances — Valeurs instantanées")
             r1_c1, r1_c2, r1_c3 = st.columns(3)
             
             # الحسابات (كتبقى هي هي)
