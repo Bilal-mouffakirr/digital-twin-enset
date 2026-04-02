@@ -113,11 +113,11 @@ mqtt_service = start_mqtt_service()
 with st.sidebar:
     st.markdown(f"""
     <div style="text-align:center; padding:20px 0;">
-       <div style="font-size:9rem;">
+       <div style="font-size:3rem;">
           <img 
             src="data:image/jpeg;base64,{img_base64}" 
             alt="ENSET"
-            style="width:9rem; height:9rem; border-radius: 0%;"
+            style="width:19rem; height:19rem; border-radius: 30%;"
              >
         </div>
         <h2 style="color:#00d1b2; font-size:1.4rem; margin:0;">ENSET Mohammedia</h2>
