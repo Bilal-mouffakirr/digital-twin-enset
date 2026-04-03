@@ -16,11 +16,12 @@ def get_base64_of_bin_file(bin_file):
 img_base64 = get_base64_of_bin_file("th.jpg")
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
-time_sleep = 0.0007
-record_every = 1.0
+
+time_sleep   = 0.0007   # سرعة تحديث الداشبورد
+record_every = 1.0   # كل كم ثانية يسجل عينة فالـ history (CSV)
 
 # ============================================================
-# 1. Page config
+# 1.
 # ============================================================
 st.set_page_config(page_title="Digital Twin PV - ENSET", layout="wide", page_icon="https://www.startpage.com/av/proxy-image?piurl=https%3A%2F%2Ftse3.mm.bing.net%2Fth%2Fid%2FOIP._SKHTtj-78Un4eybBA2wkQHaHa%3Fpid%3DApi&sp=1775076847Tb1a92041ca968dd0518d99783a819921ac64735d498fc70eabc66865c2ec68be")
 
@@ -53,15 +54,16 @@ TOPICS_MAP = {
 FULL_TOPICS = list(TOPICS_MAP.keys())
 
 # ============================================================
-# 3. Global store
+# 3.
 # ============================================================
 @st.cache_resource
 def get_global_store():
     return {
-        "store": {k: 0.0 for k in TOPICS_MAP.values()},
-        "history": [],
-        "connected": False,
-        "last_error": ""
+        "store":       {k: 0.0 for k in TOPICS_MAP.values()},
+        "history":     [],
+        "connected":   False,
+        "last_error":  "",
+        "last_record": 0.0,
     }
 
 global_data  = get_global_store()
@@ -154,47 +156,14 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("⚙️ Paramètres")
-    st.caption(f"Rafraîchissement : {time_sleep} s")
-    st.caption("Historique max   : 1000 pts")
+    st.caption(f"Rafraîchissement dashboard : {time_sleep} s")
+    st.caption(f"Enregistrement CSV        : {record_every} s")
+    st.caption("Historique max            : 1000 pts")
     if global_data["last_error"]:
         st.warning(f"⚠️ {global_data['last_error']}")
 
 # ============================================================
-# 6. Chart helpers
-# ============================================================
-def make_area_chart(y_data, color, fill_color, title, y_min=0, y_max=7000, y_label="W"):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        y=y_data, mode='lines', fill='tozeroy',
-        line=dict(color=color, width=2),
-        fillcolor=fill_color
-    ))
-    fig.update_layout(
-        title=title, template="plotly_dark", height=280,
-        margin=dict(l=0, r=0, t=40, b=0),
-        showlegend=False,
-        yaxis=dict(title=y_label, range=[y_min, y_max], fixedrange=True),
-        xaxis_title="Échantillon"
-    )
-    return fig
-
-def make_line_chart(y_data, color, title, y_min=0, y_max=600, y_label="V"):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        y=y_data, mode='lines',
-        line=dict(color=color, width=2)
-    ))
-    fig.update_layout(
-        title=title, template="plotly_dark", height=260,
-        margin=dict(l=0, r=0, t=40, b=0),
-        showlegend=False,
-        yaxis=dict(title=y_label, range=[y_min, y_max], fixedrange=True),
-        xaxis_title="Échantillon"
-    )
-    return fig
-
-# ============================================================
-# 7. Boucle principale
+# 6. Boucle principale
 # ============================================================
 st.title("Digital Twin ENSET: Cloud Monitoring Pro")
 placeholder = st.empty()
@@ -204,7 +173,7 @@ while True:
         current_vals = data_store.copy()
         now = time.time()
 
-        # ✅ تسجيل عينة كل 1 ثانية فقط
+        # ✅ تسجيل عينة كل record_every ثانية فقط
         if now - global_data["last_record"] >= record_every:
             history_list.append(current_vals.copy())
             global_data["last_record"] = now
@@ -217,15 +186,16 @@ while True:
             df = pd.DataFrame(columns=list(TOPICS_MAP.values()))
 
         with placeholder.container():
- 
+
+            # ── Attente données ──────────────────────────────────
             if current_vals["P_pv"] == 0 and current_vals["V_inv"] == 0:
                 st.warning("⏳ En attente de données... Vérifiez votre Gateway.")
-                st.info(f"📡 Topics surveillés sous: `{PREFIX}`")
+                st.info(f"📡Topics surveillés sous: `{PREFIX}`")
                 time.sleep(0.5)
                 continue
- 
+
             # ========================================================
-            # ROW 1 — Puissances
+            # ROW 1 — Puissances (3 Columns)
             # ========================================================
             st.subheader("Puissances — Valeurs instantanées")
             r1_c1, r1_c2, r1_c3 = st.columns(3)
@@ -240,19 +210,19 @@ while True:
             st.markdown(" ")
 
             # ========================================================
-            # ROW 2 — Tensions & Performance
+            # ROW 2 — Tensions & Performance (3 Columns)
             # ========================================================
             st.subheader("Tensions & Performance")
             r2_c1, r2_c2, r2_c3 = st.columns(3)
 
-            with r2_c1: st.metric("V_inv RMS", f"{v_rms:.2f} V")
-            with r2_c2: st.metric("V_PV",      f"{current_vals['V_pv']:.1f} V")
-            with r2_c3: st.metric("Rendement", f"{eff:.1f} %")
+            with r2_c1: st.metric("V_inv RMS",   f"{v_rms:.2f} V")
+            with r2_c2: st.metric("V_PV",        f"{current_vals['V_pv']:.1f} V")
+            with r2_c3: st.metric("Rendement",   f"{eff:.1f} %")
 
             st.markdown("---")
 
             # ========================================================
-            # ROW 3 — S, Q, P, FP
+            # ROW 3 — Puissance Apparente S + Reactive Q + FP
             # ========================================================
             st.subheader("Puissances Apparente & Réactive")
             s1, s2, s3, s4 = st.columns(4)
@@ -262,10 +232,10 @@ while True:
             P_val = current_vals['P_inv']
             fp    = (P_val / S_val) if S_val > 0.1 else 0.0
 
-            with s1: st.metric("🔵 S — Apparente",        f"{S_val:.1f} VA")
-            with s2: st.metric("🟠 Q — Réactive",         f"{Q_val:.1f} VAR")
-            with s3: st.metric("🟢 P — Active",           f"{P_val:.1f} W")
-            with s4: st.metric("📊 Facteur de Puissance", f"{fp:.3f}")
+            with s1: st.metric("🔵 S — Apparente",         f"{S_val:.1f} VA")
+            with s2: st.metric("🟠 Q — Réactive",          f"{Q_val:.1f} VAR")
+            with s3: st.metric("🟢 P — Active",            f"{P_val:.1f} W")
+            with s4: st.metric("📊 Facteur de Puissance",  f"{fp:.3f}")
 
             st.markdown("---")
 
@@ -318,57 +288,79 @@ while True:
             st.markdown("---")
 
             # ========================================================
-            # ROW 5 — Courbes Puissances — Y fixe : 0 → 10 000 W
+            # ROW 5 — Courbes Puissances (Y fixe 0-10000 W)
             # ========================================================
             st.subheader("Évolution des Puissances Actives")
             pc1, pc2, pc3 = st.columns(3)
 
+            def make_area_chart(y_data, color, fill_color, title, y_min=0, y_max=10000, y_label="W"):
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    y=y_data, mode='lines', fill='tozeroy',
+                    line=dict(color=color, width=2),
+                    fillcolor=fill_color
+                ))
+                fig.update_layout(
+                    title=title, template="plotly_dark", height=280,
+                    margin=dict(l=0, r=0, t=40, b=0),
+                    showlegend=False,
+                    yaxis=dict(title=y_label, range=[y_min, y_max], fixedrange=True),
+                    xaxis_title="Échantillon"
+                )
+                return fig
+
             with pc1:
                 st.plotly_chart(
-                    make_area_chart(df['P_pv'],  '#00d1b2', 'rgba(0,209,178,0.15)',
-                                    'Puissance PV (W)',          y_min=0, y_max=6500),
+                    make_area_chart(df['P_pv'],  '#00d1b2', 'rgba(0,209,178,0.15)', 'Puissance PV (W)', y_min=0, y_max=10000),
                     use_container_width=True, key="chart_p_pv"
                 )
             with pc2:
                 st.plotly_chart(
-                    make_area_chart(df['P_dc'],  '#FFDD57', 'rgba(255,221,87,0.15)',
-                                    'Puissance Boost DC (W)',    y_min=0, y_max=6500),
+                    make_area_chart(df['P_dc'],  '#FFDD57', 'rgba(255,221,87,0.15)', 'Puissance Boost DC (W)', y_min=0, y_max=10000),
                     use_container_width=True, key="chart_p_dc"
                 )
             with pc3:
                 st.plotly_chart(
-                    make_area_chart(df['P_inv'], '#ff3860', 'rgba(255,56,96,0.15)',
-                                    'Puissance Onduleur AC (W)', y_min=0, y_max=5000),
+                    make_area_chart(df['P_inv'], '#ff3860', 'rgba(255,56,96,0.15)', 'Puissance Onduleur AC (W)', y_min=0, y_max=10000),
                     use_container_width=True, key="chart_p_inv"
                 )
 
             st.markdown("---")
 
             # ========================================================
-            # ROW 6 — Courbes Tensions — Y fixe par signal
+            # ROW 6 — Courbes Tensions (Y fixe par signal)
             # ========================================================
             st.subheader("Évolution des Tensions")
             vc1, vc2, vc3 = st.columns(3)
 
+            def make_line_chart(y_data, color, title, y_min=0, y_max=600, y_label="V"):
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    y=y_data, mode='lines',
+                    line=dict(color=color, width=2)
+                ))
+                fig.update_layout(
+                    title=title, template="plotly_dark", height=260,
+                    margin=dict(l=0, r=0, t=40, b=0),
+                    showlegend=False,
+                    yaxis=dict(title=y_label, range=[y_min, y_max], fixedrange=True),
+                    xaxis_title="Échantillon"
+                )
+                return fig
+
             with vc1:
-                # Tension PV  : 0 → 600 V
                 st.plotly_chart(
-                    make_line_chart(df['V_pv'], '#00d1b2', 'Tension PV (V)',
-                                    y_min=0, y_max=315),
+                    make_line_chart(df['V_pv'], '#00d1b2', 'Tension PV (V)', y_min=0, y_max=600),
                     use_container_width=True, key="chart_v_pv"
                 )
             with vc2:
-                # Bus DC      : 0 → 600 V
                 st.plotly_chart(
-                    make_line_chart(df['V_dc'], '#FFDD57', 'Tension Bus DC (V)',
-                                    y_min=0, y_max=610),
+                    make_line_chart(df['V_dc'], '#FFDD57', 'Tension Bus DC (V)', y_min=0, y_max=600),
                     use_container_width=True, key="chart_v_dc"
                 )
             with vc3:
-                # Onduleur AC : -320 → +320 V
                 st.plotly_chart(
-                    make_line_chart(df['V_inv'], '#3273DC', 'Tension Onduleur AC (V)',
-                                    y_min=0, y_max=220),
+                    make_line_chart(df['V_inv'], '#3273DC', 'Tension Onduleur AC (V)', y_min=-320, y_max=320),
                     use_container_width=True, key="chart_v_ac"
                 )
 
