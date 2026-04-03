@@ -311,7 +311,7 @@ while True:
 
             with pc1:
                 st.plotly_chart(
-                    make_area_chart(df['P_pv'],  '#00d1b2', 'rgba(0,209,178,0.15)', 'Puissance PV (W)', y_min=0, y_max=5500),
+                    make_area_chart(df['P_pv'],  '#00d1b2', 'rgba(0,209,178,0.15)', 'Puissance PV (W)', y_min=0, y_max=6700),
                     use_container_width=True, key="chart_p_pv"
                 )
             with pc2:
