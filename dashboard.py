@@ -318,19 +318,19 @@ while True:
             with pc1:
                 st.plotly_chart(
                     make_area_chart(df['P_pv'],  '#00d1b2', 'rgba(0,209,178,0.15)',
-                                    'Puissance PV (W)',          y_min=0, y_max=10000),
+                                    'Puissance PV (W)',          y_min=0, y_max=7000),
                     use_container_width=True, key="chart_p_pv"
                 )
             with pc2:
                 st.plotly_chart(
                     make_area_chart(df['P_dc'],  '#FFDD57', 'rgba(255,221,87,0.15)',
-                                    'Puissance Boost DC (W)',    y_min=0, y_max=10000),
+                                    'Puissance Boost DC (W)',    y_min=0, y_max=6000),
                     use_container_width=True, key="chart_p_dc"
                 )
             with pc3:
                 st.plotly_chart(
                     make_area_chart(df['P_inv'], '#ff3860', 'rgba(255,56,96,0.15)',
-                                    'Puissance Onduleur AC (W)', y_min=0, y_max=10000),
+                                    'Puissance Onduleur AC (W)', y_min=0, y_max=5000),
                     use_container_width=True, key="chart_p_inv"
                 )
 
@@ -353,7 +353,7 @@ while True:
                 # Bus DC      : 0 → 600 V
                 st.plotly_chart(
                     make_line_chart(df['V_dc'], '#FFDD57', 'Tension Bus DC (V)',
-                                    y_min=0, y_max=600),
+                                    y_min=0, y_max=620),
                     use_container_width=True, key="chart_v_dc"
                 )
             with vc3:
