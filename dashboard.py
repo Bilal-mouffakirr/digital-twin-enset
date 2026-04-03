@@ -16,7 +16,7 @@ def get_base64_of_bin_file(bin_file):
 img_base64 = get_base64_of_bin_file("th.jpg")
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
-time_sleep = 0.001
+time_sleep = 0.0005
 
 # ============================================================
 # 1. Page config
