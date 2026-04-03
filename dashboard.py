@@ -17,6 +17,7 @@ img_base64 = get_base64_of_bin_file("th.jpg")
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 time_sleep = 0.0007
+record_every = 1.0
 
 # ============================================================
 # 1. Page config
@@ -200,12 +201,14 @@ placeholder = st.empty()
 
 while True:
     try:
-        current_vals = data_store.copy()
-        history_list.append(current_vals.copy())
-        if len(history_list) > 1000:
-            history_list.pop(0)
-
-        df = pd.DataFrame(history_list).astype(float)
+           if now - global_data["last_record"] >= record_every:
+            history_list.append(current_vals.copy())
+            global_data["last_record"] = now
+            if len(history_list) > 1000:
+                history_list.pop(0)
+        df = pd.DataFrame(history_list).astype(float) if history_list else pd.DataFrame(
+            columns=list(TOPICS_MAP.values())
+        )
 
         with placeholder.container():
 
