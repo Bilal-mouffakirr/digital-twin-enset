@@ -16,7 +16,7 @@ def get_base64_of_bin_file(bin_file):
 img_base64 = get_base64_of_bin_file("th.jpg")
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
-time_sleep = 0.0005
+time_sleep = 0.0007
 
 # ============================================================
 # 1. Page config
@@ -161,7 +161,7 @@ with st.sidebar:
 # ============================================================
 # 6. Chart helpers
 # ============================================================
-def make_area_chart(y_data, color, fill_color, title, y_min=0, y_max=10000, y_label="W"):
+def make_area_chart(y_data, color, fill_color, title, y_min=0, y_max=7000, y_label="W"):
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         y=y_data, mode='lines', fill='tozeroy',
@@ -318,13 +318,13 @@ while True:
             with pc1:
                 st.plotly_chart(
                     make_area_chart(df['P_pv'],  '#00d1b2', 'rgba(0,209,178,0.15)',
-                                    'Puissance PV (W)',          y_min=0, y_max=7000),
+                                    'Puissance PV (W)',          y_min=0, y_max=6500),
                     use_container_width=True, key="chart_p_pv"
                 )
             with pc2:
                 st.plotly_chart(
                     make_area_chart(df['P_dc'],  '#FFDD57', 'rgba(255,221,87,0.15)',
-                                    'Puissance Boost DC (W)',    y_min=0, y_max=6000),
+                                    'Puissance Boost DC (W)',    y_min=0, y_max=6500),
                     use_container_width=True, key="chart_p_dc"
                 )
             with pc3:
@@ -346,21 +346,21 @@ while True:
                 # Tension PV  : 0 → 600 V
                 st.plotly_chart(
                     make_line_chart(df['V_pv'], '#00d1b2', 'Tension PV (V)',
-                                    y_min=0, y_max=600),
+                                    y_min=0, y_max=315),
                     use_container_width=True, key="chart_v_pv"
                 )
             with vc2:
                 # Bus DC      : 0 → 600 V
                 st.plotly_chart(
                     make_line_chart(df['V_dc'], '#FFDD57', 'Tension Bus DC (V)',
-                                    y_min=0, y_max=620),
+                                    y_min=0, y_max=610),
                     use_container_width=True, key="chart_v_dc"
                 )
             with vc3:
                 # Onduleur AC : -320 → +320 V
                 st.plotly_chart(
                     make_line_chart(df['V_inv'], '#3273DC', 'Tension Onduleur AC (V)',
-                                    y_min=-320, y_max=320),
+                                    y_min=0, y_max=220),
                     use_container_width=True, key="chart_v_ac"
                 )
 
