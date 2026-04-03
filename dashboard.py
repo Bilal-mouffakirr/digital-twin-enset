@@ -198,26 +198,25 @@ def make_line_chart(y_data, color, title, y_min=0, y_max=600, y_label="V"):
 # ============================================================
 st.title("Digital Twin ENSET: Cloud Monitoring Pro")
 placeholder = st.empty()
- 
+
 while True:
     try:
         current_vals = data_store.copy()
         now = time.time()
- 
-        # تسجيل عينة فقط إذا مضى record_every ثانية
+
+        # ✅ تسجيل عينة كل 1 ثانية فقط
         if now - global_data["last_record"] >= record_every:
             history_list.append(current_vals.copy())
             global_data["last_record"] = now
             if len(history_list) > 1000:
                 history_list.pop(0)
- 
+
         if history_list:
             df = pd.DataFrame(history_list).astype(float)
         else:
             df = pd.DataFrame(columns=list(TOPICS_MAP.values()))
- 
-      
-    with placeholder.container():
+
+        with placeholder.container():
  
             if current_vals["P_pv"] == 0 and current_vals["V_inv"] == 0:
                 st.warning("⏳ En attente de données... Vérifiez votre Gateway.")
