@@ -158,7 +158,7 @@ with st.sidebar:
     st.subheader("⚙️ Paramètres")
     st.caption(f"Rafraîchissement dashboard : {time_sleep} s")
     st.caption(f"Enregistrement CSV        : {record_every} s")
-    st.caption("Historique max            : 1000 pts")
+    st.caption("Historique max            : 10000 pts")
     if global_data["last_error"]:
         st.warning(f"⚠️ {global_data['last_error']}")
 
@@ -177,7 +177,7 @@ while True:
         if now - global_data["last_record"] >= record_every:
             history_list.append(current_vals.copy())
             global_data["last_record"] = now
-            if len(history_list) > 1000:
+            if len(history_list) > 10000:
                 history_list.pop(0)
 
         if history_list:
