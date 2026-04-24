@@ -75,7 +75,9 @@ TOPICS_MAP = {
 FULL_TOPICS = list(TOPICS_MAP.keys())
 
 # ── Open-Meteo Forecast API URL ──────────────────────────────────
-OPENMETEO_URL = "https://api.open-meteo.com/v1/forecast"
+LATITUDE = 33.70
+LONGITUDE = -7.38
+URL_METEO = f"https://api.open-meteo.com/v1/forecast?latitude={LATITUDE}&longitude={LONGITUDE}&current=temperature_2m,shortwave_radiation"
 
 # ── Color Palette ────────────────────────────────────────────────
 C = {
