@@ -17,6 +17,8 @@ import base64
 import warnings
 from io import StringIO
 from datetime import datetime, timedelta
+import pathlib
+import streamlit.components.v1 as components
 
 # ── Optional pvlib import ────────────────────────────────────────
 try:
@@ -562,6 +564,48 @@ def make_power_triangle_chart(P: float, Q: float, S: float) -> go.Figure:
 
 
 # ════════════════════════════════════════════════════════════════════
+# SECTION 7b — 3D PANEL WIDGET
+# ════════════════════════════════════════════════════════════════════
+
+def render_3d_panel(p_inv: float, thd_v: float, thd_i: float):
+    """
+    Embed the interactive 3D PV panel widget (pv_panel_3d.html).
+
+    Auto-selects the defect mode from live MQTT values:
+      - ok   → P_inv normal, THD < 5 %
+      - warn → THD entre 5 % et 8 %  OU  légère chute de puissance
+      - err  → THD > 8 %  OU  P_inv quasi nul (panne détectée)
+    """
+    html_path = pathlib.Path(__file__).parent / "pv_panel_3d.html"
+    if not html_path.exists():
+        st.error("⚠️ Fichier `pv_panel_3d.html` introuvable — placez-le dans le même dossier.")
+        return
+
+    html_src = html_path.read_text(encoding="utf-8")
+
+    # ── Détermination automatique du mode ────────────────────────
+    if thd_v > 8 or thd_i > 8 or (0 < p_inv < 50):
+        auto_mode = "err"
+    elif thd_v > 5 or thd_i > 5:
+        auto_mode = "warn"
+    else:
+        auto_mode = "ok"
+
+    # ── Injection du script d'initialisation ─────────────────────
+    inject = f"""
+    <script>
+    // Auto-apply mode derived from live MQTT data
+    window.addEventListener('load', function() {{
+        setMode('{auto_mode}');
+    }});
+    </script>
+    """
+    html_src = html_src.replace("</body>", inject + "\n</body>")
+
+    components.html(html_src, height=620, scrolling=False)
+
+
+# ════════════════════════════════════════════════════════════════════
 # SECTION 8 — SIDEBAR RENDERER
 # ════════════════════════════════════════════════════════════════════
 
@@ -664,11 +708,12 @@ def render_dashboard(current_vals: dict, df: pd.DataFrame,
     Render all dashboard sections inside the Streamlit placeholder.
     Organised into tabs for clarity.
     """
-    tab_rt, tab_cmp, tab_elec, tab_thd = st.tabs([
+    tab_rt, tab_cmp, tab_elec, tab_thd, tab_3d = st.tabs([
         "⚡ Temps Réel (MQTT)",
         "📊 Analyse Comparative",
         "🔌 Grandeurs Électriques",
         "〰️ Qualité Réseau (THD)",
+        "🧩 Vue 3D — Panneau PV",
     ])
 
     # ────────────────────────────────────────────────────────────
@@ -927,6 +972,58 @@ def render_dashboard(current_vals: dict, df: pd.DataFrame,
             st.plotly_chart(fig_thd_hist, use_container_width=True, key="ch_thd_hist")
         else:
             st.info("⏳ Historique insuffisant.")
+
+    # ────────────────────────────────────────────────────────────
+    # TAB 5 — Interactive 3D PV Panel
+    # ────────────────────────────────────────────────────────────
+    with tab_3d:
+        st.markdown('<p class="section-header">Vue 3D — État du Panneau Solaire</p>',
+                    unsafe_allow_html=True)
+
+        # ── Live KPIs above the panel ────────────────────────────
+        k1, k2, k3, k4 = st.columns(4)
+        thd_v_live = current_vals['THD_V']
+        thd_i_live = current_vals['THD_I']
+        p_inv_live = current_vals['P_inv']
+
+        # Determine status label & color for display
+        if thd_v_live > 8 or thd_i_live > 8 or (0 < p_inv_live < 50):
+            status_label = "❌ PANNE CRITIQUE"
+            status_color = C["red"]
+        elif thd_v_live > 5 or thd_i_live > 5:
+            status_label = "⚠️ DÉFAUT PARTIEL"
+            status_color = C["amber"]
+        else:
+            status_label = "✅ NOMINAL"
+            status_color = C["green"]
+
+        with k1: st.metric("🔌 P_Onduleur",  f"{p_inv_live:.1f} W")
+        with k2: st.metric("〰️ THD_V",       f"{thd_v_live:.2f} %")
+        with k3: st.metric("〰️ THD_I",       f"{thd_i_live:.2f} %")
+        with k4:
+            st.markdown(
+                f'<div style="background:{status_color}22;border:1px solid {status_color};"'
+                f' class="stMetric"><p style="font-size:0.75rem;color:{C["muted"]};margin:0;">'
+                f'Diagnostic Auto</p>'
+                f'<p style="font-size:1rem;font-weight:700;color:{status_color};margin:4px 0 0;">'
+                f'{status_label}</p></div>',
+                unsafe_allow_html=True,
+            )
+
+        st.markdown(" ")
+        st.caption(
+            "🖱️ **Glisser** pour faire pivoter le panneau · "
+            "**Cliquer** sur une cellule pour voir ses paramètres · "
+            "Les boutons Normal / Défaut / Panne permettent de simuler des scénarios"
+        )
+        st.markdown("---")
+
+        # ── 3D Panel widget ──────────────────────────────────────
+        render_3d_panel(
+            p_inv = p_inv_live,
+            thd_v = thd_v_live,
+            thd_i = thd_i_live,
+        )
 
 
 # ════════════════════════════════════════════════════════════════════
