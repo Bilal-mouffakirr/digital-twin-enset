@@ -1,7 +1,0 @@
-streamlit
-fmpy
-pvlib
-plotly
-requests
-numpy
-pandas
