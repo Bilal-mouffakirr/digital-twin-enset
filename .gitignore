@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.fmu_extracted/
+data/*.csv
+!data/sample_data.json
+.DS_Store
