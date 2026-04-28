@@ -1,475 +1,455 @@
 """
-PV MPPT Inverter – Streamlit Dashboard
-Modèle : PV_MPPT_Inverter1 (Simulink R2024a, FMI 2.0)
-Auteur : Bilal Mouffakir
+╔══════════════════════════════════════════════════════════════════╗
+║         Solar Digital Twin — PV + MPPT + Inverter               ║
+║         Mohammedia, Morocco | FMU Co-Simulation (FMI 2.0)        ║
+║         Author: Bilal Mouffakir                                   ║
+╚══════════════════════════════════════════════════════════════════╝
+
+FMU Variables (from modelDescription.xml):
+  Inputs:
+    - Inport   → Solar Irradiance GHI (W/m²)
+    - Inport1  → Temperature (°C)
+
+  Outputs:
+    - Vonduleur          → Inverter Output Voltage (V)
+    - Pbooste            → Boost Converter Power (W)
+    - Ppanneau           → PV Panel Power (W)
+    - S_ondu             → Apparent Power (VA)
+    - P_ondu             → Active Power (W)
+    - Q_ondu             → Reactive Power (VAR)
+    - THD_V              → Total Harmonic Distortion - Voltage (%)
+    - THD_i              → Total Harmonic Distortion - Current (%)
+    - rendemet de onduleur → Inverter Efficiency (%)
 """
 
-import streamlit as st
+import os
+import time
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import sys, os
+import requests
+import streamlit as st
+from datetime import datetime
 
-# ── FMPy (si disponible, sinon modèle physique interne) ──────────────────────
-FMU_PATH = os.path.join(os.path.dirname(__file__), "fmu", "PV_MPPT_Inverter1.fmu")
-FMPY_AVAILABLE = False
+# ── FMPy import (graceful fallback if not installed yet) ──────────────────────
 try:
-    from fmpy import simulate_fmu, read_model_description
+    from fmpy import read_model_description, extract
+    from fmpy.fmi2 import FMU2Slave
     FMPY_AVAILABLE = True
 except ImportError:
-    pass
+    FMPY_AVAILABLE = False
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Page config
-# ─────────────────────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="PV MPPT Inverter Dashboard",
-    page_icon="☀️",
-    layout="wide",
-    initial_sidebar_state="expanded",
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# FMU file — must live in the same directory as app.py (relative path for cloud)
+FMU_PATH = os.path.join(os.path.dirname(__file__), "model.fmu")
+
+# Open-Meteo API — Mohammedia, Morocco
+LAT, LON = 33.68, -7.38
+WEATHER_API_URL = (
+    "https://api.open-meteo.com/v1/forecast"
+    f"?latitude={LAT}&longitude={LON}"
+    "&current=temperature_2m,direct_normal_irradiance,global_tilted_irradiance"
+    "&timezone=Africa%2FCasablanca"
+    "&forecast_days=1"
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CSS
-# ─────────────────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-[data-testid="stSidebar"] { background: #0d1117; }
-[data-testid="stSidebar"] * { color: #e6edf3 !important; }
-.kpi-box {
-    background: #161b22; border: 1px solid #30363d; border-radius: 10px;
-    padding: 14px 16px; text-align: center; margin-bottom: 8px;
-    border-top: 3px solid var(--color);
-}
-.kpi-label { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: .8px; }
-.kpi-value { font-size: 28px; font-weight: 700; }
-.kpi-unit  { font-size: 13px; color: #8b949e; }
-.block-title { font-size: 13px; font-weight: 600; color: #8b949e;
-               text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
-.stAlert { border-radius: 8px; }
-</style>
-""", unsafe_allow_html=True)
+# Simulation time window (seconds) — keep short for cloud performance
+SIM_START   = 0.0
+SIM_STOP    = 1.0          # 1 second of electrical simulation
+SIM_STEP    = 1e-3         # 1 ms communication step
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers – génération des profils
-# ─────────────────────────────────────────────────────────────────────────────
-def gen_irradiance(profile, t, g_init, g_final, t_step, g_amp, g_period):
-    """Génère le profil d'irradiance G (W/m²)."""
-    if profile == "Échelon":
-        return np.where(t < t_step, g_init, g_final)
-    elif profile == "Rampe":
-        return np.clip(g_init + (g_final - g_init) * (t / t[-1]), 0, 1200)
-    elif profile == "Jour (sinusoïde)":
-        return np.maximum(0, g_amp * np.sin(np.pi * t / t[-1]))
-    elif profile == "Nuage (aléatoire)":
-        base = g_init + (g_final - g_init) * (t / t[-1])
-        rng  = np.random.default_rng(42)
-        noise = rng.normal(0, g_amp * 0.15, size=len(t))
-        cloud = 150 * np.sin(2 * np.pi * t / (g_period + 1e-9))
-        return np.clip(base + noise + cloud, 10, 1200)
-    elif profile == "Constante":
-        return np.full_like(t, g_init)
-    elif profile == "Double échelon":
-        out = np.where(t < t[-1]*0.33, g_init,
-              np.where(t < t[-1]*0.66, g_final, (g_init+g_final)/2))
-        return out
-    return np.full_like(t, g_init)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  1. WEATHER DATA  (Open-Meteo)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-
-def gen_temperature(profile, t, t_init, t_final, t_amp, t_period):
-    """Génère le profil de température T (°C)."""
-    if profile == "Constante":
-        return np.full_like(t, t_init)
-    elif profile == "Rampe":
-        return t_init + (t_final - t_init) * (t / t[-1])
-    elif profile == "Sinusoïde":
-        return t_init + t_amp * np.sin(2 * np.pi * t / (t_period + 1e-9))
-    elif profile == "Échelon":
-        return np.where(t < t[-1]*0.5, t_init, t_final)
-    return np.full_like(t, t_init)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Simulation physique (modèle PV analytique)
-# ─────────────────────────────────────────────────────────────────────────────
-def run_physics_simulation(G_vec, T_vec, dt):
+@st.cache_data(ttl=600)          # refresh every 10 minutes
+def fetch_weather() -> dict:
     """
-    Modèle analytique calibré sur le FMU PV_MPPT_Inverter1 :
-    - Panneau PV : modèle à 5 paramètres (Isc, Voc, FF)
-    - MPPT : P&O parfait (rendement tracking ~99%)
-    - Boost : η = 96%
-    - Onduleur : η = 94%, filtre LC (THD calculé)
+    Fetches current weather from Open-Meteo for Mohammedia, Morocco.
+    Returns a dict with keys: temperature (°C), ghi (W/m²), dni (W/m²),
+    timestamp, and optionally 'error'.
     """
-    N = len(G_vec)
+    try:
+        resp = requests.get(WEATHER_API_URL, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
 
-    # Paramètres panneau (calibrés sur modelDescription.xml)
-    Isc_ref  = 8.21    # A  (à G=1000, T=25°C)
-    Voc_ref  = 45.5    # V
-    Ns       = 20      # modules série
-    Np       = 5       # strings parallèle
-    alpha_I  = 0.0053  # /°C
-    beta_V   = -0.145  # V/°C
-    T_ref    = 25.0    # °C
-    eta_boost= 0.96
-    eta_inv  = 0.94
-    V_grid   = 220.0   # V RMS
+        current = data.get("current", {})
+        temperature = current.get("temperature_2m", 25.0)
+        ghi         = current.get("global_tilted_irradiance", 800.0)
+        dni         = current.get("direct_normal_irradiance", 700.0)
+        timestamp   = current.get("time", datetime.now().strftime("%Y-%m-%dT%H:%M"))
 
-    Ppv_arr   = np.zeros(N)
-    Pboost_arr= np.zeros(N)
-    Vond_arr  = np.zeros(N)
-    Pondu_arr = np.zeros(N)
-    Qondu_arr = np.zeros(N)
-    Sondu_arr = np.zeros(N)
-    THDV_arr  = np.zeros(N)
-    THDi_arr  = np.zeros(N)
-    rend_arr  = np.zeros(N)
+        return {
+            "temperature": float(temperature),
+            "ghi":         float(ghi),
+            "dni":         float(dni),
+            "timestamp":   timestamp,
+            "error":       None,
+        }
+    except requests.exceptions.ConnectionError:
+        return _fallback_weather("Connection error — using default values.")
+    except requests.exceptions.Timeout:
+        return _fallback_weather("API timeout — using default values.")
+    except Exception as exc:
+        return _fallback_weather(f"Unexpected error: {exc}")
 
-    for i in range(N):
-        G = max(G_vec[i], 0.1)
-        T = T_vec[i]
 
-        # Courant court-circuit & tension circuit-ouvert corrigés
-        Isc = Isc_ref * (G / 1000.0) * (1 + alpha_I * (T - T_ref))
-        Voc = (Voc_ref + beta_V * (T - T_ref))
+def _fallback_weather(reason: str) -> dict:
+    """Returns safe default values when the API is unavailable."""
+    return {
+        "temperature": 25.0,
+        "ghi":         800.0,
+        "dni":         700.0,
+        "timestamp":   datetime.now().strftime("%Y-%m-%dT%H:%M"),
+        "error":       reason,
+    }
 
-        # Facteur de forme (dépend de T)
-        FF = max(0.60, 0.79 - 0.0005 * (T - T_ref) - 0.003 * (1000/G - 1))
 
-        # Puissance MPPT panneau total
-        Ppv = Isc * Voc * FF * Ns * Np
+# ═══════════════════════════════════════════════════════════════════════════════
+#  2. FMU SIMULATION  (fmpy + Co-Simulation)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-        # Boost
-        Pboost = Ppv * eta_boost
+def run_fmu_simulation(temperature: float, irradiance: float) -> dict | None:
+    """
+    Runs the PV_MPPT_Inverter FMU (Co-Simulation, FMI 2.0) for a short
+    time window and returns time-averaged output values.
 
-        # Onduleur – puissance active
-        Pondu = Pboost * eta_inv
+    FMU Input mapping:
+        Inport   ← irradiance  (W/m²)
+        Inport1  ← temperature (°C)
 
-        # Puissance réactive (déphasage filtre LC)
-        phi_rad = 0.06 + 0.05 * (1 - G/1000)
-        Qondu   = Pondu * np.tan(phi_rad)
-        Sondu   = np.hypot(Pondu, Qondu)
+    FMU Output mapping:
+        Vonduleur           → inverter_voltage   (V)
+        Pbooste             → boost_power        (W)
+        Ppanneau            → panel_power        (W)
+        S_ondu              → apparent_power     (VA)
+        P_ondu              → active_power       (W)
+        Q_ondu              → reactive_power     (VAR)
+        THD_V               → thd_voltage        (%)
+        THD_i               → thd_current        (%)
+        rendemet de onduleur→ efficiency         (%)
+    """
+    if not FMPY_AVAILABLE:
+        st.warning("fmpy is not installed. Showing analytical estimate instead.")
+        return None
 
-        # Tension de sortie onduleur (quasi-constante si grid-tied)
-        Vond = V_grid * (0.985 + 0.015 * (G/1000))
+    if not os.path.isfile(FMU_PATH):
+        st.error(
+            f"❌ FMU file not found at `{FMU_PATH}`.\n\n"
+            "Make sure `model.fmu` is in the same folder as `app.py`."
+        )
+        return None
 
-        # THD (modèle empirique : diminue avec G, augmente avec T)
-        THD_V = max(0.4, 5.2 - 4.5*(G/1000) + 0.018*(T-25))
-        THD_i = max(0.3, 4.1 - 3.6*(G/1000) + 0.012*(T-25))
+    try:
+        # ── Read model description ──────────────────────────────────────────
+        model_desc = read_model_description(FMU_PATH)
 
-        # Rendement onduleur (= Pondu / Ppv)
-        rend = min(100.0, (Pondu / max(Ppv, 1e-3)) * 100)
+        # Build a name→valueReference lookup
+        vr = {v.name: v.valueReference for v in model_desc.modelVariables}
 
-        Ppv_arr[i]    = Ppv
-        Pboost_arr[i] = Pboost
-        Vond_arr[i]   = Vond
-        Pondu_arr[i]  = Pondu
-        Qondu_arr[i]  = Qondu
-        Sondu_arr[i]  = Sondu
-        THDV_arr[i]   = THD_V
-        THDi_arr[i]   = THD_i
-        rend_arr[i]   = rend
+        # ── Extract FMU to a temp directory ────────────────────────────────
+        unzip_dir = extract(FMU_PATH)
 
-    return pd.DataFrame({
-        "time"       : np.arange(N) * dt,
-        "G"          : G_vec,
-        "T"          : T_vec,
-        "Ppanneau"   : Ppv_arr,
-        "Pbooste"    : Pboost_arr,
-        "Vonduleur"  : Vond_arr,
-        "P_ondu"     : Pondu_arr,
-        "Q_ondu"     : Qondu_arr,
-        "S_ondu"     : Sondu_arr,
-        "THD_V"      : THDV_arr,
-        "THD_i"      : THDi_arr,
-        "rendement"  : rend_arr,
+        # ── Instantiate FMU slave ───────────────────────────────────────────
+        fmu = FMU2Slave(
+            guid            = model_desc.guid,
+            unzipDirectory  = unzip_dir,
+            modelIdentifier = model_desc.coSimulation.modelIdentifier,
+            instanceName    = "solar_twin",
+        )
+
+        fmu.instantiate()
+        fmu.setupExperiment(startTime=SIM_START, stopTime=SIM_STOP)
+        fmu.enterInitializationMode()
+
+        # ── Set inputs before initialization completes ──────────────────────
+        fmu.setReal([vr["Inport"]],  [irradiance])   # GHI → PV irradiance
+        fmu.setReal([vr["Inport1"]], [temperature])  # T   → cell temperature
+
+        fmu.exitInitializationMode()
+
+        # ── Step through simulation ──────────────────────────────────────────
+        output_names = [
+            "Vonduleur", "Pbooste", "Ppanneau",
+            "S_ondu", "P_ondu", "Q_ondu",
+            "THD_V", "THD_i", "rendemet de onduleur",
+        ]
+        output_vrs  = [vr[n] for n in output_names]
+
+        records = []
+        t = SIM_START
+        while t < SIM_STOP:
+            fmu.doStep(currentCommunicationPoint=t, communicationStepSize=SIM_STEP)
+            values = fmu.getReal(output_vrs)
+            records.append([t] + list(values))
+            t += SIM_STEP
+
+        fmu.terminate()
+        fmu.freeInstance()
+
+        # ── Build results DataFrame ─────────────────────────────────────────
+        cols = ["time"] + output_names
+        df   = pd.DataFrame(records, columns=cols)
+
+        # Return final-cycle averages (last 20 % of simulation = steady state)
+        ss = df.iloc[int(len(df) * 0.8):]
+        return {
+            "df":              df,
+            "inverter_voltage": ss["Vonduleur"].mean(),
+            "boost_power":      ss["Pbooste"].mean(),
+            "panel_power":      ss["Ppanneau"].mean(),
+            "apparent_power":   ss["S_ondu"].mean(),
+            "active_power":     ss["P_ondu"].mean(),
+            "reactive_power":   ss["Q_ondu"].mean(),
+            "thd_voltage":      ss["THD_V"].mean(),
+            "thd_current":      ss["THD_i"].mean(),
+            "efficiency":       ss["rendemet de onduleur"].mean(),
+        }
+
+    except Exception as exc:
+        st.error(f"FMU simulation error: {exc}")
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  3. ANALYTICAL FALLBACK  (when FMU is unavailable)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def analytical_estimate(temperature: float, irradiance: float) -> dict:
+    """
+    Simple physics-based estimate used when the FMU cannot be run
+    (e.g. missing binary on the cloud).  NOT a substitute for the real model.
+    """
+    G_ref, T_ref    = 1000.0, 25.0
+    P_rated         = 5000.0    # W  — adjust to match your PV array
+    eta_mppt        = 0.98
+    eta_inverter    = 0.96
+    temp_coeff      = -0.004    # %/°C power temperature coefficient
+
+    G_ratio  = max(irradiance / G_ref, 0.0)
+    T_derate = 1 + temp_coeff * (temperature - T_ref)
+
+    panel_power   = P_rated * G_ratio * T_derate
+    boost_power   = panel_power * eta_mppt
+    active_power  = boost_power * eta_inverter
+    voltage       = 230.0 * (G_ratio ** 0.05)   # slight sag at low irradiance
+    efficiency    = eta_inverter * 100.0
+
+    # Build a synthetic 1-second waveform for the chart
+    t_vals = np.linspace(0, 1, 1000)
+    noise  = np.random.normal(0, active_power * 0.005, len(t_vals))
+    df = pd.DataFrame({
+        "time":       t_vals,
+        "Ppanneau":   panel_power  + noise,
+        "P_ondu":     active_power + noise * 0.96,
+        "Vonduleur":  voltage      + np.random.normal(0, 0.5, len(t_vals)),
     })
 
-
-def run_fmu_simulation(G_vec, T_vec, dt):
-    """Simulation via FMPy (si dispo + plateforme Windows)."""
-    try:
-        from fmpy import simulate_fmu
-        import tempfile, shutil
-
-        stop  = len(G_vec) * dt
-        times = np.arange(len(G_vec)) * dt
-        input_data = np.array(
-            [(t, G_vec[i], T_vec[i]) for i, t in enumerate(times)],
-            dtype=[("time","f8"),("Inport","f8"),("Inport1","f8")]
-        )
-        res = simulate_fmu(
-            FMU_PATH,
-            start_time=0.0,
-            stop_time=stop,
-            step_size=dt,
-            input=input_data,
-            output=["Vonduleur","Pbooste","Ppanneau","S_ondu",
-                    "P_ondu","Q_ondu","THD_V","THD_i","rendemet de onduleur"],
-        )
-        df = pd.DataFrame(res)
-        df.rename(columns={"rendemet de onduleur":"rendement","time":"time"}, inplace=True)
-        df["G"] = np.interp(df["time"], times, G_vec)
-        df["T"] = np.interp(df["time"], times, T_vec)
-        return df
-    except Exception as e:
-        st.warning(f"⚠️ FMPy échoué ({e}) → modèle physique utilisé.")
-        return run_physics_simulation(G_vec, T_vec, dt)
+    return {
+        "df":              df,
+        "inverter_voltage": voltage,
+        "boost_power":      boost_power,
+        "panel_power":      panel_power,
+        "apparent_power":   active_power / 0.98,
+        "active_power":     active_power,
+        "reactive_power":   active_power * 0.1,
+        "thd_voltage":      2.1,
+        "thd_current":      3.4,
+        "efficiency":       efficiency,
+        "is_estimate":      True,
+    }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Plotly helpers
-# ─────────────────────────────────────────────────────────────────────────────
-DARK = dict(
-    paper_bgcolor="#0d1117",
-    plot_bgcolor="#161b22",
-    font=dict(color="#8b949e", size=11),
-    xaxis=dict(gridcolor="#21262d", zerolinecolor="#30363d"),
-    yaxis=dict(gridcolor="#21262d", zerolinecolor="#30363d"),
-    legend=dict(bgcolor="#0d111700", font=dict(size=10)),
-    margin=dict(l=50, r=20, t=30, b=40),
-)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  4. STREAMLIT  UI
+# ═══════════════════════════════════════════════════════════════════════════════
 
-COLORS = {
-    "G"        : "#f0a500",
-    "T"        : "#f85149",
-    "Ppanneau" : "#f0a500",
-    "Pbooste"  : "#58a6ff",
-    "P_ondu"   : "#2ea043",
-    "Q_ondu"   : "#f85149",
-    "S_ondu"   : "#e3b341",
-    "Vonduleur": "#bc8cff",
-    "THD_V"    : "#f85149",
-    "THD_i"    : "#e3b341",
-    "rendement": "#2ea043",
-}
-
-def line_fig(df, cols, title, yaxis_title, height=300, secondary=None):
-    fig = go.Figure()
-    for c in cols:
-        fig.add_trace(go.Scatter(
-            x=df["time"], y=df[c],
-            name=c, mode="lines",
-            line=dict(color=COLORS.get(c,"#aaa"), width=2),
-        ))
-    fig.update_layout(title=dict(text=title, font=dict(size=13, color="#e6edf3")),
-                      height=height, yaxis_title=yaxis_title, xaxis_title="Temps (s)", **DARK)
-    return fig
-
-
-def kpi_html(label, value, unit, color):
-    return f"""
-    <div class="kpi-box" style="--color:{color}">
-      <div class="kpi-label">{label}</div>
-      <div class="kpi-value" style="color:{color}">{value}</div>
-      <div class="kpi-unit">{unit}</div>
-    </div>"""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SIDEBAR
-# ─────────────────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.image("https://img.icons8.com/emoji/96/sun-emoji.png", width=60)
-    st.markdown("## **PV MPPT Inverter**")
-    st.caption("Simulink R2024a · FMI 2.0 · Bilal Mouffakir")
-    st.divider()
-
-    # ── Simulation params ──
-    st.markdown("### ⚙️ Paramètres Simulation")
-    sim_dur = st.slider("Durée (s)", 0.05, 1.0, 0.2, 0.05)
-    dt_us   = st.select_slider("Pas dt", options=[10,20,50,100,200,500], value=100)
-    dt      = dt_us * 1e-6
-    N       = min(5000, int(sim_dur / dt))
-
-    backend = "FMPy (FMU)" if FMPY_AVAILABLE else "Modèle physique (FMPy absent)"
-    st.info(f"🔧 Backend : {backend}", icon="ℹ️")
-    st.caption(f"Points de simulation : {N:,}")
-
-    st.divider()
-
-    # ── Irradiance Profile ──
-    st.markdown("### 🌤 Profil Irradiance G (W/m²)")
-    g_profile = st.selectbox("Type de profil G", [
-        "Échelon", "Rampe", "Constante", "Jour (sinusoïde)",
-        "Nuage (aléatoire)", "Double échelon"
-    ])
-
-    g_init   = st.slider("G initial (W/m²)", 50, 1000, 200, 50)
-    g_final  = st.slider("G final (W/m²)",   50, 1000, 800, 50,
-                          disabled=(g_profile in ["Constante","Jour (sinusoïde)"]))
-    t_step_g = st.slider("Instant échelon (s)", 0.01, sim_dur*0.9,
-                          sim_dur*0.4, 0.01,
-                          disabled=(g_profile not in ["Échelon","Double échelon"]))
-    g_amp    = st.slider("Amplitude max (W/m²)", 200, 1200, 1000, 50,
-                          disabled=(g_profile not in ["Jour (sinusoïde)","Nuage (aléatoire)"]))
-    g_period = st.slider("Période nuage (s)", 0.02, 0.5, 0.1, 0.01,
-                          disabled=(g_profile != "Nuage (aléatoire)"))
-
-    st.divider()
-
-    # ── Temperature Profile ──
-    st.markdown("### 🌡 Profil Température T (°C)")
-    t_profile = st.selectbox("Type de profil T", [
-        "Constante", "Rampe", "Sinusoïde", "Échelon"
-    ])
-    t_init   = st.slider("T initiale (°C)",  0, 75, 25, 1)
-    t_final  = st.slider("T finale (°C)",    0, 80, 55, 1,
-                          disabled=(t_profile in ["Constante","Sinusoïde"]))
-    t_amp    = st.slider("Amplitude T (°C)", 1, 30,  15, 1,
-                          disabled=(t_profile != "Sinusoïde"))
-    t_period = st.slider("Période T (s)",    0.02, 1.0, 0.2, 0.01,
-                          disabled=(t_profile != "Sinusoïde"))
-
-    st.divider()
-    run = st.button("▶ LANCER LA SIMULATION", use_container_width=True, type="primary")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HEADER
-# ─────────────────────────────────────────────────────────────────────────────
-st.markdown("# ☀️ PV MPPT Inverter — Dashboard")
-st.markdown(
-    "**Modèle :** `PV_MPPT_Inverter1.fmu` &nbsp;|&nbsp; "
-    "**Entrées :** `Inport` (G W/m²) · `Inport1` (T °C) &nbsp;|&nbsp; "
-    "**Sorties :** 9 variables &nbsp;|&nbsp; **Auteur :** Bilal Mouffakir"
-)
-st.divider()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────────────────
-if not run:
-    st.info("👈 Configurez les profils dans le panneau gauche puis cliquez **▶ LANCER LA SIMULATION**")
-
-    # Aperçu des profils
-    t_prev = np.linspace(0, sim_dur, 300)
-    G_prev = gen_irradiance(g_profile, t_prev, g_init, g_final, t_step_g, g_amp, g_period)
-    T_prev = gen_temperature(t_profile, t_prev, t_init, t_final, t_amp, t_period)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("#### 🌤 Aperçu — Irradiance G")
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=t_prev, y=G_prev, fill="tozeroy",
-                                  fillcolor="#f0a50018", line=dict(color="#f0a500", width=2), name="G (W/m²)"))
-        fig.update_layout(height=220, yaxis_title="W/m²", xaxis_title="Temps (s)", **DARK)
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col2:
-        st.markdown("#### 🌡 Aperçu — Température T")
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=t_prev, y=T_prev, fill="tozeroy",
-                                  fillcolor="#f8514918", line=dict(color="#f85149", width=2), name="T (°C)"))
-        fig.update_layout(height=220, yaxis_title="°C", xaxis_title="Temps (s)", **DARK)
-        st.plotly_chart(fig, use_container_width=True)
-    st.stop()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# RUN
-# ─────────────────────────────────────────────────────────────────────────────
-with st.spinner("⏳ Simulation en cours..."):
-    t_vec = np.linspace(0, sim_dur, N)
-    G_vec = gen_irradiance(g_profile, t_vec, g_init, g_final, t_step_g, g_amp, g_period)
-    T_vec = gen_temperature(t_profile, t_vec, t_init, t_final, t_amp, t_period)
-
-    if FMPY_AVAILABLE and os.path.exists(FMU_PATH):
-        df = run_fmu_simulation(G_vec, T_vec, dt)
-    else:
-        df = run_physics_simulation(G_vec, T_vec, dt)
-
-st.success(f"✅ Simulation terminée — {len(df):,} points | dt={dt_us} µs | durée={sim_dur} s")
-
-# ─── KPIs ────────────────────────────────────────────────────────────────────
-last = df.iloc[-1]
-st.markdown("### 📊 Valeurs Finales (régime permanent)")
-c1,c2,c3,c4,c5,c6 = st.columns(6)
-with c1: st.markdown(kpi_html("Ppanneau",f"{last.Ppanneau:.0f}","W","#f0a500"), unsafe_allow_html=True)
-with c2: st.markdown(kpi_html("P_ondu",  f"{last.P_ondu:.0f}","W","#2ea043"),  unsafe_allow_html=True)
-with c3: st.markdown(kpi_html("Pbooste", f"{last.Pbooste:.0f}","W","#58a6ff"), unsafe_allow_html=True)
-with c4: st.markdown(kpi_html("Vonduleur",f"{last.Vonduleur:.1f}","V","#bc8cff"), unsafe_allow_html=True)
-with c5: st.markdown(kpi_html("THD_V",   f"{last.THD_V:.2f}","%","#f85149"),  unsafe_allow_html=True)
-with c6: st.markdown(kpi_html("Rendement",f"{last.rendement:.1f}","%","#e3b341"), unsafe_allow_html=True)
-
-st.divider()
-
-# ─── Profils entrées ─────────────────────────────────────────────────────────
-st.markdown("### 📥 Profils d'Entrée")
-col1, col2 = st.columns(2)
-with col1:
-    fig = line_fig(df, ["G"], f"Irradiance G — {g_profile}", "W/m²", height=250)
-    fig.data[0].fill = "tozeroy"
-    fig.data[0].fillcolor = "#f0a50015"
-    st.plotly_chart(fig, use_container_width=True)
-with col2:
-    fig = line_fig(df, ["T"], f"Température T — {t_profile}", "°C", height=250)
-    fig.data[0].line.color = "#f85149"
-    fig.data[0].fill = "tozeroy"
-    fig.data[0].fillcolor = "#f8514915"
-    st.plotly_chart(fig, use_container_width=True)
-
-# ─── Puissances ──────────────────────────────────────────────────────────────
-st.markdown("### ⚡ Puissances — Sorties du Modèle")
-fig = line_fig(df, ["Ppanneau","Pbooste","P_ondu"],
-               "Ppanneau · Pbooste · P_ondu", "Puissance (W)", height=320)
-st.plotly_chart(fig, use_container_width=True)
-
-col1, col2 = st.columns(2)
-with col1:
-    fig = line_fig(df, ["P_ondu","Q_ondu","S_ondu"],
-                   "Puissances P / Q / S Onduleur", "Puissance", height=290)
-    st.plotly_chart(fig, use_container_width=True)
-with col2:
-    fig = line_fig(df, ["Vonduleur"], "Tension Onduleur (RMS)", "V (RMS)", height=290)
-    fig.data[0].fill = "tozeroy"
-    fig.data[0].fillcolor = "#bc8cff15"
-    st.plotly_chart(fig, use_container_width=True)
-
-# ─── Qualité ─────────────────────────────────────────────────────────────────
-st.markdown("### 🌊 Qualité — THD & Rendement")
-col1, col2 = st.columns(2)
-with col1:
-    fig = line_fig(df, ["THD_V","THD_i"], "THD Tension & Courant", "THD (%)", height=280)
-    st.plotly_chart(fig, use_container_width=True)
-with col2:
-    fig = line_fig(df, ["rendement"], "Rendement Onduleur", "%", height=280)
-    fig.data[0].fill = "tozeroy"
-    fig.data[0].fillcolor = "#2ea04315"
-    fig.update_layout(yaxis=dict(range=[0,105]))
-    st.plotly_chart(fig, use_container_width=True)
-
-# ─── Corrélations G → sorties ────────────────────────────────────────────────
-st.markdown("### 🔗 Corrélations : Irradiance G → Sorties")
-col1, col2, col3 = st.columns(3)
-scatter_cfg = dict(mode="markers",
-                   marker=dict(size=3, color=df["G"], colorscale="Oranges",
-                               showscale=True, colorbar=dict(title="G W/m²", thickness=8)))
-with col1:
-    fig = go.Figure(go.Scatter(x=df["G"], y=df["Ppanneau"],
-                               name="Ppanneau", **scatter_cfg))
-    fig.update_layout(height=250, xaxis_title="G (W/m²)", yaxis_title="Ppanneau (W)", **DARK)
-    st.plotly_chart(fig, use_container_width=True)
-with col2:
-    fig = go.Figure(go.Scatter(x=df["G"], y=df["rendement"],
-                               name="Rendement", **scatter_cfg))
-    fig.update_layout(height=250, xaxis_title="G (W/m²)", yaxis_title="Rendement (%)", **DARK)
-    st.plotly_chart(fig, use_container_width=True)
-with col3:
-    fig = go.Figure(go.Scatter(x=df["G"], y=df["THD_V"],
-                               name="THD_V", **scatter_cfg))
-    fig.update_layout(height=250, xaxis_title="G (W/m²)", yaxis_title="THD_V (%)", **DARK)
-    st.plotly_chart(fig, use_container_width=True)
-
-# ─── Tableau récap ────────────────────────────────────────────────────────────
-with st.expander("📋 Tableau de données complet"):
-    st.dataframe(
-        df.round(4).style.background_gradient(subset=["Ppanneau","P_ondu","rendement"], cmap="Greens")
-                         .background_gradient(subset=["THD_V","THD_i"], cmap="Reds"),
-        use_container_width=True, height=300
+def main():
+    # ── Page config ─────────────────────────────────────────────────────────
+    st.set_page_config(
+        page_title="Solar Digital Twin — Mohammedia",
+        page_icon="☀️",
+        layout="wide",
+        initial_sidebar_state="expanded",
     )
-    csv = df.to_csv(index=False).encode()
-    st.download_button("⬇️ Télécharger CSV", csv, "PV_MPPT_results.csv", "text/csv")
 
-st.caption("PV_MPPT_Inverter1 · Simulink R2024a · FMI 2.0 · Bilal Mouffakir · 2026")
+    # ── Custom CSS ───────────────────────────────────────────────────────────
+    st.markdown("""
+    <style>
+        :root {
+            --sun:    #f5a623;
+            --green:  #27ae60;
+            --blue:   #2980b9;
+            --dark:   #1a1a2e;
+        }
+        .block-container { padding-top: 1.5rem; }
+        h1 { color: var(--sun); font-size: 2rem !important; }
+        .stMetric label  { font-size: 0.8rem !important; color: #888; }
+        .stMetric [data-testid="stMetricValue"] { font-size: 1.6rem !important; }
+        .badge {
+            display: inline-block;
+            background: #f5a62322;
+            color: #f5a623;
+            border: 1px solid #f5a62366;
+            border-radius: 6px;
+            padding: 2px 10px;
+            font-size: 0.78rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+        }
+        .section-card {
+            background: #ffffff08;
+            border: 1px solid #ffffff15;
+            border-radius: 12px;
+            padding: 1rem 1.2rem;
+            margin-bottom: 1rem;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # ── Header ───────────────────────────────────────────────────────────────
+    st.markdown('<p class="badge">☀️ DIGITAL TWIN · FMI 2.0 Co-Simulation</p>', unsafe_allow_html=True)
+    st.title("Solar PV · MPPT · Inverter — Digital Twin")
+    st.caption("📍 Mohammedia, Morocco  |  Real-time weather → FMU simulation")
+
+    # ── Sidebar controls ────────────────────────────────────────────────────
+    with st.sidebar:
+        st.header("⚙️ Controls")
+        override = st.toggle("Manual input override", value=False)
+
+        if override:
+            man_irr  = st.slider("Irradiance GHI (W/m²)", 0, 1200, 800)
+            man_temp = st.slider("Temperature (°C)", -10, 70, 25)
+        else:
+            man_irr  = None
+            man_temp = None
+
+        run_btn = st.button("▶ Run Simulation", type="primary", use_container_width=True)
+
+        st.divider()
+        st.markdown("**FMU file:**")
+        fmu_exists = os.path.isfile(FMU_PATH)
+        if fmu_exists:
+            st.success(f"✅ `model.fmu` found")
+        else:
+            st.warning("⚠️ `model.fmu` not found\n\nAnalytical estimate will be used.")
+        st.markdown("**fmpy:**")
+        if FMPY_AVAILABLE:
+            st.success("✅ Installed")
+        else:
+            st.warning("⚠️ Not installed — using estimate")
+
+    # ── Fetch weather ────────────────────────────────────────────────────────
+    with st.spinner("🌤 Fetching weather data from Open-Meteo…"):
+        wx = fetch_weather()
+
+    if wx["error"]:
+        st.warning(f"⚠️ Weather API: {wx['error']}")
+
+    temperature = man_temp if override else wx["temperature"]
+    irradiance  = man_irr  if override else wx["ghi"]
+
+    # ── Weather metrics row ──────────────────────────────────────────────────
+    st.subheader("🌡 Current Weather · Mohammedia")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Temperature",      f"{wx['temperature']:.1f} °C",  delta=None)
+    c2.metric("GHI (Global Horiz. Irr.)", f"{wx['ghi']:.0f} W/m²")
+    c3.metric("DNI (Direct Normal Irr.)", f"{wx['dni']:.0f} W/m²")
+    c4.metric("Last update", wx["timestamp"][-5:])   # HH:MM
+
+    if override:
+        st.info(f"🛠 Manual override active — Irradiance: **{irradiance} W/m²**, Temperature: **{temperature} °C**")
+
+    st.divider()
+
+    # ── Run / display simulation ─────────────────────────────────────────────
+    if run_btn or "sim_results" not in st.session_state:
+        with st.spinner("⚙️ Running FMU Co-Simulation…"):
+            results = run_fmu_simulation(temperature, irradiance)
+            if results is None:
+                results = analytical_estimate(temperature, irradiance)
+                results["is_estimate"] = True
+            else:
+                results["is_estimate"] = False
+        st.session_state["sim_results"] = results
+        st.session_state["sim_inputs"]  = (temperature, irradiance)
+
+    results = st.session_state.get("sim_results")
+    sim_T, sim_G = st.session_state.get("sim_inputs", (temperature, irradiance))
+
+    if results is None:
+        st.info("Press **▶ Run Simulation** to start.")
+        return
+
+    if results.get("is_estimate"):
+        st.warning(
+            "ℹ️ FMU not available — showing **analytical estimate** based on PV physics. "
+            "Upload `model.fmu` to the app directory for full co-simulation."
+        )
+
+    # ── Simulation inputs ────────────────────────────────────────────────────
+    st.subheader("📥 Simulation Inputs")
+    si1, si2 = st.columns(2)
+    si1.metric("🌡 Temperature used", f"{sim_T:.1f} °C")
+    si2.metric("☀️ Irradiance used",  f"{sim_G:.0f} W/m²")
+
+    st.divider()
+
+    # ── PV / MPPT results ────────────────────────────────────────────────────
+    st.subheader("🔆 PV Panel & MPPT Results")
+    r1, r2, r3 = st.columns(3)
+    r1.metric("Panel Power Ppanneau",    f"{results['panel_power']:.1f} W")
+    r2.metric("Boost Power Pbooste",     f"{results['boost_power']:.1f} W")
+    r3.metric("Inverter Voltage Vonduleur", f"{results['inverter_voltage']:.2f} V")
+
+    # ── Inverter / Grid results ──────────────────────────────────────────────
+    st.subheader("⚡ Inverter & Grid Power Quality")
+    g1, g2, g3, g4, g5 = st.columns(5)
+    g1.metric("Active Power P",    f"{results['active_power']:.1f} W")
+    g2.metric("Reactive Power Q",  f"{results['reactive_power']:.1f} VAR")
+    g3.metric("Apparent Power S",  f"{results['apparent_power']:.1f} VA")
+    g4.metric("THD Voltage",       f"{results['thd_voltage']:.2f} %")
+    g5.metric("THD Current",       f"{results['thd_current']:.2f} %")
+
+    st.metric("Inverter Efficiency η", f"{results['efficiency']:.2f} %")
+
+    st.divider()
+
+    # ── Power time-series chart ──────────────────────────────────────────────
+    st.subheader("📈 Power Time-Series (Simulation Window)")
+    df: pd.DataFrame = results["df"]
+
+    # Select columns that exist and are numeric
+    plot_cols = [c for c in ["Ppanneau", "P_ondu", "Pbooste"] if c in df.columns]
+    if plot_cols:
+        chart_df = df.set_index("time")[plot_cols].rename(columns={
+            "Ppanneau": "Panel Power (W)",
+            "P_ondu":   "Active Power (W)",
+            "Pbooste":  "Boost Power (W)",
+        })
+        st.line_chart(chart_df, height=320)
+
+    # ── Voltage chart ────────────────────────────────────────────────────────
+    if "Vonduleur" in df.columns:
+        st.subheader("🔌 Inverter Output Voltage (V)")
+        st.line_chart(df.set_index("time")[["Vonduleur"]].rename(
+            columns={"Vonduleur": "Voltage (V)"}), height=220)
+
+    # ── Raw data expander ────────────────────────────────────────────────────
+    with st.expander("🗂 Raw simulation data (DataFrame)"):
+        st.dataframe(df.round(4), use_container_width=True)
+
+    # ── Footer ───────────────────────────────────────────────────────────────
+    st.divider()
+    st.caption(
+        "Digital Twin · PV_MPPT_Inverter1 · FMI 2.0 Co-Simulation  |  "
+        "Weather: [Open-Meteo](https://open-meteo.com/)  |  "
+        "Built with [Streamlit](https://streamlit.io/) + [fmpy](https://github.com/CATIA-Systems/FMPy)"
+    )
+
+
+if __name__ == "__main__":
+    main()
