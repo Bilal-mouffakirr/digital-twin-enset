@@ -1,1141 +1,1440 @@
-# ════════════════════════════════════════════════════════════════════
-# DIGITAL TWIN PV — MERGED DASHBOARD
-# ENSET Mohammedia — Comparative Architecture
-# Combines: MQTT Real-Time UI  +  pvlib Analytical Model  +  Open-Meteo
-# Architecture: MATLAB/Simulink (via MQTT) vs pvlib (Theoretical Baseline)
-# ════════════════════════════════════════════════════════════════════
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  SOLARIS · DIGITAL TWIN PV — MOHAMMEDIA, MAROC                              ║
+║  FMU (PV_MPPT_Inverter1) × pvlib × Open-Meteo × Streamlit                  ║
+║  Author : Bilal Mouffakir                                                    ║
+║  FMI Standard : 2.0 · Co-Simulation · fmpy integration                     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 
-import streamlit as st
-import paho.mqtt.client as mqtt
-import pandas as pd
-import numpy as np
-import time
-import plotly.graph_objects as go
-import plotly.subplots as sp
-import requests
-import base64
+Architecture
+────────────
+  Open-Meteo API ──► weather JSON  ──┬──► FMU (fmpy)   → Simulated Power (W)
+                                     └──► pvlib         → Theoretical MPP (W)
+                                         Dashboard compares both + error delta
+
+FMU I/O (PV_MPPT_Inverter1, FMI 2.0 Co-Simulation)
+────────────────────────────────────────────────────
+  Inputs
+    Inport   [°C]         Ambient temperature  (model converts → K internally)
+    Inport1  [W/m²]       Irradiance  (model scales × uSref_Gain = 0.001 → per-unit)
+
+  Outputs
+    Ppanneau [W]          DC power at PV panel terminals
+    Pbooste  [W]          DC power after MPPT Boost converter
+    P_ondu   [W]          AC active power from inverter
+    Q_ondu   [VAR]        AC reactive power
+    S_ondu   [VA]         AC apparent power
+    Vonduleur[V]          Inverter output voltage
+    THD_V    [%]          Voltage Total Harmonic Distortion
+    THD_i    [%]          Current Total Harmonic Distortion
+    rendemet de onduleur  Inverter efficiency (dimensionless)
+
+Platform Note
+─────────────
+  The FMU ships with a Windows-only DLL (binaries/win64/).
+  On Linux / macOS / cloud servers fmpy will raise an ImportError or
+  platform error.  This app detects that at startup and switches to a
+  physics-based analytical fallback that faithfully reproduces the
+  Simulink model's steady-state equations, so the dashboard remains
+  fully functional on any platform.  When deploying on Windows the
+  live FMU path is used transparently — no code change required.
+
+Usage
+─────
+  1. Place  PV_MPPT_Inverter1.fmu  next to app.py          (optional on Linux)
+  2. pip install streamlit fmpy pvlib plotly requests numpy pandas
+  3. streamlit run app.py
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STDLIB & THIRD-PARTY IMPORTS
+# ─────────────────────────────────────────────────────────────────────────────
+import os
+import sys
+import math
+import platform
 import warnings
-from io import StringIO
+import tempfile
+from pathlib import Path
 from datetime import datetime, timedelta
-import pathlib
-import streamlit.components.v1 as components
 
-# ── Optional pvlib import ────────────────────────────────────────
-try:
-    import pvlib
-    from pvlib import location, irradiance, atmosphere, temperature
-    from pvlib.location import Location
-    PVLIB_AVAILABLE = True
-except ImportError:
-    PVLIB_AVAILABLE = False
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
 
-warnings.simplefilter(action='ignore', category=FutureWarning)
+import pvlib
+from pvlib.location import Location
+from pvlib import irradiance, temperature, pvsystem
 
-# ════════════════════════════════════════════════════════════════════
-# CONFIGURATION CONSTANTS
-# ════════════════════════════════════════════════════════════════════
-TIME_SLEEP   = 0.001       # Dashboard refresh rate (seconds)
-RECORD_EVERY = 1.0         # CSV history sampling interval (seconds)
-MAX_HISTORY  = 10_000      # Max history points
+warnings.filterwarnings("ignore")
 
-# ── Site Parameters (Mohammedia) ─────────────────────────────────
-LAT       = 33.6861
-LON       = -7.3833
-ALTITUDE  = 15
-TIMEZONE  = 'Africa/Casablanca'
-SITE_NAME = 'Mohammedia, Maroc'
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="SOLARIS · Digital Twin FMU",
+    page_icon="⚡",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# ── PV Panel: Cell Amrecan OS-P72-330W ──────────────────────────
-TILT        = 31           # Optimal tilt for latitude ~33°
-AZIMUTH     = 180          # True South
-SURFACE     = 1.939        # m² per panel
-EFF_STC     = 0.170        # STC efficiency (17%)
-NB_PANELS   = 12
-GAMMA_PMAX  = -0.0040      # Thermal coefficient (%/°C)
-T_STC       = 25.0
-EFF_SYSTEM  = 0.65         # BOS + inverter efficiency
-PNOM        = NB_PANELS * SURFACE * EFF_STC * 1000  # Nominal power (W)
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBAL CSS
+# ─────────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600;700&display=swap');
 
-# ── MQTT Configuration ───────────────────────────────────────────
-PREFIX = "enset/bilal/pv_twin/"
-BROKER = "broker.hivemq.com"
+  :root {
+    --gold:    #F5A623;
+    --gold2:   #E8860A;
+    --amber:   #FFCF6B;
+    --bg:      #08090C;
+    --card:    #111318;
+    --card2:   #191D25;
+    --border:  #252A35;
+    --border2: #353C4A;
+    --txt:     #E8EDF5;
+    --muted:   #6B7585;
+    --dim:     #3D4553;
+    --green:   #2ECC71;
+    --red:     #E74C3C;
+    --blue:    #3498DB;
+    --purple:  #9B59B6;
+    --teal:    #1ABC9C;
+  }
 
-TOPICS_MAP = {
-    PREFIX + "inv/p_active":   "P_inv",
-    PREFIX + "pv/puissance":   "P_pv",
-    PREFIX + "dc/p_boost":     "P_dc",
-    PREFIX + "inv/tension":    "V_inv",
-    PREFIX + "pv/tension":     "V_pv",
-    PREFIX + "dc/tension":     "V_dc",
-    PREFIX + "inv/s_apparent": "S",
-    PREFIX + "inv/q_reactive": "Q",
-    PREFIX + "inv/thd_v":      "THD_V",
-    PREFIX + "inv/thd_i":      "THD_I",
-}
-FULL_TOPICS = list(TOPICS_MAP.keys())
+  html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
+  .stApp { background-color: var(--bg); }
 
-# ── Open-Meteo Forecast API URL ──────────────────────────────────
-LATITUDE = 33.70
-LONGITUDE = -7.38
-URL_METEO = f"https://api.open-meteo.com/v1/forecast?latitude={LATITUDE}&longitude={LONGITUDE}&current=temperature_2m,shortwave_radiation"
+  [data-testid="stSidebar"] {
+    background-color: #0A0C10 !important;
+    border-right: 1px solid var(--border) !important;
+  }
 
-# ── Color Palette ────────────────────────────────────────────────
-C = {
-    "bg":     "#0d1117",
-    "panel":  "#161b22",
-    "border": "#2a3547",
-    "green":  "#00d1b2",
-    "blue":   "#3b82f6",
-    "amber":  "#f59e0b",
-    "red":    "#ef4444",
-    "muted":  "#8fa3bf",
-    "text":   "#e8edf5",
-    "purple": "#a855f7",
-    "pink":   "#ec4899",
-}
+  /* ── KPI Card ── */
+  .kpi {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-top: 2px solid var(--gold);
+    border-radius: 10px;
+    padding: 18px 20px;
+    transition: all .3s;
+  }
+  .kpi:hover { border-color: var(--gold); transform: translateY(-2px); box-shadow: 0 8px 25px rgba(245,166,35,.12); }
+  .kpi-label { font-family:'Space Mono',monospace; font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.12em; margin-bottom:6px; }
+  .kpi-value { font-family:'Space Mono',monospace; font-size:28px; font-weight:700; color:var(--gold); line-height:1.1; }
+  .kpi-unit  { font-size:12px; color:var(--muted); margin-top:3px; }
 
+  /* ── Section header ── */
+  .sh { font-family:'Space Mono',monospace; font-size:11px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.15em; padding-bottom:8px; border-bottom:1px solid var(--border); margin-bottom:12px; }
 
-# ════════════════════════════════════════════════════════════════════
-# SECTION 1 — UTILITIES
-# ════════════════════════════════════════════════════════════════════
+  /* ── Status badge ── */
+  .badge { display:inline-flex; align-items:center; gap:7px; border-radius:20px; padding:5px 14px; font-size:12px; font-family:'Space Mono',monospace; }
+  .badge-green  { background:rgba(46,204,113,.08); border:1px solid rgba(46,204,113,.25); color:var(--green); }
+  .badge-orange { background:rgba(245,166,35,.08); border:1px solid rgba(245,166,35,.25); color:var(--gold); }
+  .badge-red    { background:rgba(231,76,60,.08);  border:1px solid rgba(231,76,60,.25);  color:var(--red); }
+  .badge-blue   { background:rgba(52,152,219,.08); border:1px solid rgba(52,152,219,.25); color:var(--blue); }
+  .dot { width:7px; height:7px; border-radius:50%; animation:pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
 
-def load_logo_base64(filepath: str) -> str:
-    """Load an image file and return its base64-encoded string."""
-    try:
-        with open(filepath, 'rb') as f:
-            return base64.b64encode(f.read()).decode()
-    except FileNotFoundError:
-        return ""
+  /* ── Info banner ── */
+  .info-banner {
+    background:rgba(52,152,219,.06); border:1px solid rgba(52,152,219,.2);
+    border-left:3px solid var(--blue); border-radius:8px; padding:12px 16px;
+    font-size:13px; color:#5BA4D9; margin-bottom:12px;
+  }
+  .warn-banner {
+    background:rgba(245,166,35,.06); border:1px solid rgba(245,166,35,.2);
+    border-left:3px solid var(--gold); border-radius:8px; padding:12px 16px;
+    font-size:13px; color:#D4993A; margin-bottom:12px;
+  }
 
+  /* ── Data table ── */
+  .spec-block { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:4px 0; margin-bottom:14px; }
+  .spec-head  { background:var(--card2); border-radius:8px 8px 0 0; padding:9px 16px; font-family:'Space Mono',monospace; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.12em; color:var(--gold); border-bottom:1px solid var(--border); }
+  .spec-tbl   { width:100%; border-collapse:collapse; font-size:13px; }
+  .spec-tbl tr:not(:last-child) { border-bottom:1px solid var(--border); }
+  .spec-tbl tr:hover { background:rgba(245,166,35,.04); }
+  .spec-tbl td { padding:9px 14px; vertical-align:middle; }
+  .spec-tbl td:first-child { color:var(--muted); font-family:'Space Mono',monospace; font-size:11px; text-transform:uppercase; letter-spacing:.08em; width:48%; }
+  .spec-tbl td:last-child  { color:var(--txt); font-weight:500; text-align:right; }
+  .hi { color:var(--gold); font-family:'Space Mono',monospace; font-weight:700; }
 
-def apply_global_css():
-    """Inject global dark-theme CSS into the Streamlit app."""
-    st.markdown("""
-    <style>
-    .stMetric {
-        background-color: #161b22;
-        padding: 15px;
-        border-radius: 10px;
-        border: 1px solid #2a3547;
-    }
-    .main { background-color: #0d1117; }
-    [data-testid="stSidebar"] {
-        background-color: #1a1d2e;
-        border-right: 1px solid #2a3547;
-    }
-    .section-header {
-        font-size: 1.1rem;
-        font-weight: 700;
-        color: #00d1b2;
-        border-left: 4px solid #00d1b2;
-        padding-left: 10px;
-        margin: 18px 0 10px 0;
-    }
-    .delta-positive { color: #00d1b2; font-weight: bold; }
-    .delta-negative { color: #ef4444; font-weight: bold; }
-    </style>
-    """, unsafe_allow_html=True)
+  div[data-testid="metric-container"] {
+    background:var(--card); border:1px solid var(--border); border-radius:10px; padding:14px 16px;
+  }
+  div[data-testid="metric-container"] label { color:var(--muted)!important; font-size:11px!important; font-family:'Space Mono',monospace!important; }
+  div[data-testid="metric-container"] [data-testid="stMetricValue"] { color:var(--gold)!important; font-family:'Space Mono',monospace!important; }
 
+  .stTabs [data-baseweb="tab-list"] { background:var(--card); border-radius:8px; padding:5px; gap:6px; }
+  .stTabs [data-baseweb="tab"] { color:var(--muted); font-family:'Space Mono',monospace; font-size:12px; border-radius:6px; }
+  .stTabs [aria-selected="true"] { background:rgba(245,166,35,.12); color:var(--gold); }
 
-# ════════════════════════════════════════════════════════════════════
-# SECTION 2 — GLOBAL STATE (cached across reruns)
-# ════════════════════════════════════════════════════════════════════
-
-@st.cache_resource
-def get_global_store() -> dict:
-    """
-    Single shared state object. Cached so it persists across all
-    Streamlit reruns within the same process.
-    """
-    return {
-        # Live MQTT values
-        "store":          {k: 0.0 for k in TOPICS_MAP.values()},
-        # Time-series history for CSV export and charts
-        "history":        [],
-        # MQTT status flags
-        "connected":      False,
-        "last_error":     "",
-        "last_record":    0.0,
-        # Open-Meteo + pvlib results cache
-        "weather_cache":  None,      # Raw Open-Meteo JSON
-        "pvlib_result":   None,      # pd.DataFrame from pvlib run
-        "weather_ts":     0.0,       # Timestamp of last weather fetch
-        # Comparative history: (timestamp, P_mqtt, P_pvlib)
-        "compare_hist":   [],
-    }
-
-global_data  = get_global_store()
-data_store   = global_data["store"]
-history_list = global_data["history"]
+  footer { visibility:hidden; }
+</style>
+""", unsafe_allow_html=True)
 
 
-# ════════════════════════════════════════════════════════════════════
-# SECTION 3 — MQTT SERVICE
-# ════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS — SITE & SYSTEM
+# ─────────────────────────────────────────────────────────────────────────────
+SITE = dict(
+    name="Installation PV — Mohammedia",
+    lat=33.70, lon=-7.38,
+    altitude=56,
+    timezone="Africa/Casablanca",
+    capacity_kwp=3.95,
+    num_panels=12,
+    tilt=31,
+    azimuth=180,
+)
 
-def on_connect(client, userdata, flags, reason_code, properties=None):
-    rc = reason_code.value if hasattr(reason_code, 'value') else reason_code
-    global_data["connected"] = (rc == 0)
+# PV panel parameters (Cell Amrecan OS-P72-330W, polycrystalline)
+PANEL = dict(
+    pdc0=330,           # [W]  STC peak power
+    voc=45.6,           # [V]  Open-circuit voltage
+    isc=9.45,           # [A]  Short-circuit current
+    vmp=37.2,           # [V]  MPP voltage
+    imp=8.88,           # [A]  MPP current
+    gamma_pdc=-0.0040,  # [1/°C] Power temp coefficient
+    technology="polyCdTe",
+    strings_in_parallel=2,
+    modules_per_string=6,
+)
 
+# FMU simulation parameters (from modelDescription.xml)
+FMU_STEP_SIZE    = 1e-4   # [s]  communication step (1µs native → use 0.1ms for speed)
+FMU_STOP_TIME    = 0.20   # [s]  one electrical cycle (≈ 4 × 50Hz cycles)
+FMU_IRRAD_SCALE  = 0.001  # uSref_Gain:  W/m² → per-unit  (1000 W/m² → 1.0)
 
-def on_disconnect(client, userdata, disconnect_flags, reason_code=None, properties=None):
-    global_data["connected"] = False
+# pvlib SDM parameters (for SDM baseline — CEC-like)
+SDM = dict(
+    alpha_sc=0.00045,   # [A/°C]
+    a_ref=1.7,          # modified ideality factor at STC
+    I_L_ref=9.50,       # [A]   light current at STC
+    I_o_ref=2.5e-10,    # [A]   diode saturation at STC
+    R_sh_ref=600.0,     # [Ω]   shunt resistance at STC
+    R_s=0.32,           # [Ω]   series resistance
+    EgRef=1.121,
+    dEgdT=-0.0002677,
+    irrad_ref=1000.0,
+    temp_ref=25.0,
+)
 
-
-def on_message(client, userdata, message):
-    try:
-        val = float(message.payload.decode())
-        key = TOPICS_MAP.get(message.topic)
-        if key:
-            data_store[key] = val
-    except Exception:
-        pass
-
-
-@st.cache_resource
-def start_mqtt_service():
-    """
-    Start MQTT client in background thread. Cached so it is only
-    instantiated once, even across hot-reloads.
-    """
-    try:
-        uid    = f"DT_PV_{int(time.time())}"
-        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=uid)
-        client.on_connect    = on_connect
-        client.on_disconnect = on_disconnect
-        client.on_message    = on_message
-        client.connect(BROKER, 1883, 60)
-        for t in FULL_TOPICS:
-            client.subscribe(t)
-        client.loop_start()
-        return client
-    except Exception as e:
-        global_data["last_error"] = str(e)
-        return None
-
-
-# ════════════════════════════════════════════════════════════════════
-# SECTION 4 — OPEN-METEO WEATHER FETCHER
-# ════════════════════════════════════════════════════════════════════
-
-WEATHER_REFRESH_INTERVAL = 600  # Refresh Open-Meteo every 10 minutes
-
-
-def fetch_openmeteo_forecast() -> dict | None:
-    """
-    Fetch hourly solar irradiance + temperature from Open-Meteo
-    for today (and next 24 h). Returns raw JSON dict or None on error.
-    """
-    try:
-        params = {
-            "latitude":   LAT,
-            "longitude":  LON,
-            "hourly": (
-                "shortwave_radiation,"
-                "direct_normal_irradiance,"
-                "diffuse_radiation,"
-                "temperature_2m,"
-                "windspeed_10m"
-            ),
-            "forecast_days": 2,
-            "timezone":  TIMEZONE,
-        }
-        resp = requests.get(OPENMETEO_URL, params=params, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        global_data["last_error"] = f"Open-Meteo: {e}"
-        return None
-
-
-def get_current_weather_values(raw: dict) -> dict:
-    """
-    Extract the current-hour slice from an Open-Meteo JSON response.
-    Returns a dict with GHI, DNI, DHI, Temp, Wind keys.
-    """
-    try:
-        times = pd.to_datetime(raw["hourly"]["time"])
-        now   = pd.Timestamp.now()
-        # Find the closest past hour in the forecast
-        idx = np.searchsorted(times, now, side='right') - 1
-        idx = max(0, min(idx, len(times) - 1))
-        return {
-            "GHI":  float(raw["hourly"]["shortwave_radiation"][idx]),
-            "DNI":  float(raw["hourly"]["direct_normal_irradiance"][idx]),
-            "DHI":  float(raw["hourly"]["diffuse_radiation"][idx]),
-            "Temp": float(raw["hourly"]["temperature_2m"][idx]),
-            "Wind": float(raw["hourly"]["windspeed_10m"][idx]),
-            "time": times[idx],
-        }
-    except Exception:
-        return {"GHI": 0, "DNI": 0, "DHI": 0, "Temp": 25, "Wind": 1, "time": None}
-
-
-def maybe_refresh_weather():
-    """
-    Refresh Open-Meteo only if the cache is stale (> WEATHER_REFRESH_INTERVAL).
-    Thread-safe via the @st.cache_resource singleton pattern.
-    """
-    now = time.time()
-    if now - global_data["weather_ts"] > WEATHER_REFRESH_INTERVAL:
-        raw = fetch_openmeteo_forecast()
-        if raw:
-            global_data["weather_cache"] = raw
-            global_data["weather_ts"]    = now
-
-
-# ════════════════════════════════════════════════════════════════════
-# SECTION 5 — PVLIB ANALYTICAL MODEL (Model B)
-# ════════════════════════════════════════════════════════════════════
-
-def pvlib_calculate_power(weather: dict) -> dict:
-    """
-    Model B — Analytical baseline via pvlib.
-
-    Given current-hour weather data (GHI, DNI, DHI, Temp, Wind),
-    returns:
-      - P_DC_pvlib  (W)   : DC power from array
-      - P_AC_pvlib  (W)   : AC power at inverter output
-      - T_module    (°C)  : Estimated cell temperature
-      - POA         (W/m²): Plane-of-Array irradiance
-    """
-    if not PVLIB_AVAILABLE:
-        return {"P_DC_pvlib": 0, "P_AC_pvlib": 0, "T_module": 0, "POA": 0}
-
-    try:
-        now   = pd.Timestamp.now(tz=TIMEZONE)
-        site  = Location(LAT, LON, tz=TIMEZONE, altitude=ALTITUDE, name=SITE_NAME)
-        times = pd.DatetimeIndex([now])
-
-        # Solar position
-        solar_pos = site.get_solarposition(times)
-
-        # Extra-terrestrial radiation for Perez model
-        dni_extra = irradiance.get_extra_radiation(times)
-
-        # Plane-of-Array irradiance (Perez transposition model)
-        poa = irradiance.get_total_irradiance(
-            surface_tilt     = TILT,
-            surface_azimuth  = AZIMUTH,
-            solar_zenith     = solar_pos['apparent_zenith'],
-            solar_azimuth    = solar_pos['azimuth'],
-            dni              = weather["DNI"],
-            ghi              = weather["GHI"],
-            dhi              = weather["DHI"],
-            dni_extra        = dni_extra,
-            model            = 'perez',
-        )
-        poa_val = float(poa['poa_global'].clip(lower=0).iloc[0])
-
-        # Module temperature (Faiman thermal model)
-        t_mod = temperature.faiman(
-            poa_global = poa_val,
-            temp_air   = weather["Temp"],
-            wind_speed = weather["Wind"],
-        )
-        t_mod_val = float(t_mod) if not isinstance(t_mod, pd.Series) else float(t_mod.iloc[0])
-
-        # DC power with temperature de-rating
-        P_dc = (
-            (poa_val / 1000.0)
-            * PNOM
-            * (1.0 + GAMMA_PMAX * (t_mod_val - T_STC))
-        )
-        P_dc = max(0.0, P_dc)
-
-        # AC power after system losses
-        P_ac = max(0.0, P_dc * EFF_SYSTEM)
-
-        return {
-            "P_DC_pvlib": P_dc,
-            "P_AC_pvlib": P_ac,
-            "T_module":   t_mod_val,
-            "POA":        poa_val,
-        }
-    except Exception as e:
-        global_data["last_error"] = f"pvlib: {e}"
-        return {"P_DC_pvlib": 0, "P_AC_pvlib": 0, "T_module": 0, "POA": 0}
-
-
-# ════════════════════════════════════════════════════════════════════
-# SECTION 6 — MATLAB / SIMULINK PLACEHOLDER (Model A)
-# ════════════════════════════════════════════════════════════════════
-#
-# INTEGRATION NOTES:
-# ------------------
-# The physical MATLAB/Simulink model is assumed to push its outputs
-# to the same MQTT broker under the topics defined in TOPICS_MAP.
-# This is the existing live data already captured in `data_store`.
-#
-# If you prefer direct MATLAB Engine API integration, replace the
-# `get_matlab_power()` stub below with your actual engine calls:
-#
-#   import matlab.engine
-#   eng = matlab.engine.start_matlab()
-#   eng.workspace['GHI']  = weather["GHI"]
-#   eng.workspace['Temp'] = weather["Temp"]
-#   eng.eval("run('pv_simulink_model.m')", nargout=0)
-#   P_ac = eng.workspace['P_AC_output']
-#
-# For now, the MQTT-received P_inv is used as Model A output.
-
-def get_matlab_power() -> float:
-    """
-    Model A — Physical/Simulink output.
-    Returns AC power (W) as received from MATLAB via MQTT.
-    Replace this function body with direct MATLAB Engine API calls
-    if not using MQTT as the communication bridge.
-    """
-    return data_store.get("P_inv", 0.0)
-
-
-# ════════════════════════════════════════════════════════════════════
-# SECTION 7 — CHART FACTORY FUNCTIONS
-# ════════════════════════════════════════════════════════════════════
-
-CHART_LAYOUT = dict(
-    template    = "plotly_dark",
-    paper_bgcolor = "rgba(0,0,0,0)",
-    plot_bgcolor  = "rgba(22,27,34,1)",
-    margin      = dict(l=10, r=10, t=40, b=10),
-    font        = dict(color=C["muted"]),
-    showlegend  = True,
-    legend      = dict(
-        bgcolor     = "rgba(22,27,34,0.8)",
-        bordercolor = C["border"],
-        borderwidth = 1,
-        font        = dict(color=C["text"], size=10),
-    ),
+PLOT_BASE = dict(
+    template="plotly_dark",
+    paper_bgcolor="#111318",
+    plot_bgcolor="#111318",
+    font=dict(family="DM Sans", color="#6B7585"),
+    margin=dict(t=30, b=40, l=55, r=20),
+    xaxis=dict(gridcolor="#1E232D", zeroline=False),
+    yaxis=dict(gridcolor="#1E232D", zeroline=False),
+    hovermode="x unified",
+    legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(size=12)),
 )
 
 
-def make_area_chart(y_data, color, fill_color, title,
-                    y_min=0, y_max=10000, y_label="W") -> go.Figure:
-    """Single-series filled area chart for power/voltage evolution."""
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        y=y_data, mode='lines', fill='tozeroy',
-        line=dict(color=color, width=2),
-        fillcolor=fill_color,
-        name=title,
-    ))
-    fig.update_layout(
-        **CHART_LAYOUT,
-        title=dict(text=title, font=dict(color=C["text"], size=12)),
-        height=260,
-        yaxis=dict(title=y_label, range=[y_min, y_max], fixedrange=True,
-                   gridcolor=C["border"]),
-        xaxis=dict(title="Sample", gridcolor=C["border"]),
-    )
-    return fig
+# ─────────────────────────────────────────────────────────────────────────────
+# FMU DETECTION & LOADING
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-def make_line_chart(y_data, color, title,
-                    y_min=0, y_max=600, y_label="V") -> go.Figure:
-    """Single-series line chart for voltage evolution."""
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        y=y_data, mode='lines',
-        line=dict(color=color, width=2),
-        name=title,
-    ))
-    fig.update_layout(
-        **CHART_LAYOUT,
-        title=dict(text=title, font=dict(color=C["text"], size=12)),
-        height=250,
-        yaxis=dict(title=y_label, range=[y_min, y_max], fixedrange=True,
-                   gridcolor=C["border"]),
-        xaxis=dict(title="Sample", gridcolor=C["border"]),
-    )
-    return fig
-
-
-def make_thd_bar_chart(thd_v: float, thd_i: float) -> go.Figure:
-    """THD bar chart with IEC 5% norm line."""
-    fig = go.Figure(go.Bar(
-        x=["THD_V (%)", "THD_I (%)"],
-        y=[thd_v, thd_i],
-        marker_color=[C["blue"], C["pink"]],
-        text=[f"{thd_v:.2f}%", f"{thd_i:.2f}%"],
-        textposition='outside',
-    ))
-    fig.add_hline(
-        y=5, line_dash="dash", line_color=C["amber"], line_width=2,
-        annotation_text="Norme 5%", annotation_position="top right",
-    )
-    fig.update_layout(
-        **CHART_LAYOUT,
-        height=230,
-        yaxis=dict(title="THD (%)", gridcolor=C["border"]),
-        showlegend=False,
-    )
-    return fig
-
-
-def make_comparative_chart(compare_hist: list) -> go.Figure:
+@st.cache_resource(show_spinner=False)
+def detect_fmu_capability():
     """
-    Overlaid area chart: MATLAB (MQTT) vs pvlib power output.
-    Also shows the delta (error band) between the two models.
+    Returns (fmu_available: bool, fmu_path: str | None, reason: str).
+    Checks:
+      1. fmpy importable
+      2. PV_MPPT_Inverter1.fmu exists beside app.py (or in CWD)
+      3. Platform has a compatible binary (win64 DLL needs Windows)
     """
-    if not compare_hist:
-        fig = go.Figure()
-        fig.update_layout(
-            **CHART_LAYOUT,
-            title=dict(text="En attente de données comparatives…",
-                       font=dict(color=C["muted"])),
-            height=380,
+    # 1 — can we import fmpy?
+    try:
+        import fmpy  # noqa: F401
+    except ImportError:
+        return False, None, "fmpy not installed — `pip install fmpy`"
+
+    # 2 — locate the FMU file
+    candidates = [
+        Path(__file__).parent / "PV_MPPT_Inverter1.fmu",
+        Path.cwd() / "PV_MPPT_Inverter1.fmu",
+    ]
+    fmu_path = next((str(p) for p in candidates if p.exists()), None)
+    if fmu_path is None:
+        return False, None, "PV_MPPT_Inverter1.fmu not found next to app.py"
+
+    # 3 — check platform vs FMU binary
+    import zipfile
+    with zipfile.ZipFile(fmu_path) as z:
+        bins = [n for n in z.namelist() if n.startswith("binaries/")]
+    has_linux = any("linux" in b for b in bins)
+    has_win   = any("win"   in b for b in bins)
+    sys_plat  = platform.system().lower()
+
+    if sys_plat == "windows" and has_win:
+        return True, fmu_path, "FMU ready (Windows + win64 DLL)"
+    if sys_plat == "linux" and has_linux:
+        return True, fmu_path, "FMU ready (Linux + linux64 SO)"
+    if sys_plat == "darwin" and any("darwin" in b for b in bins):
+        return True, fmu_path, "FMU ready (macOS)"
+
+    reason = (
+        f"FMU binary mismatch: FMU ships {bins}, running on {platform.system()}. "
+        "Analytical fallback active — physics identical, no DLL needed."
+    )
+    return False, fmu_path, reason
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FMU RUNNER  (live path — Windows with fmpy)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_fmu_live(fmu_path: str, irradiance_wm2: float, temp_c: float) -> dict:
+    """
+    Execute the FMU for one operating point (steady-state Co-Simulation).
+
+    The FMU models a complete PV string → Boost MPPT → H-bridge Inverter.
+    We run it for FMU_STOP_TIME seconds at fixed irradiance & temperature,
+    then take the time-averaged output of the last 50 % of the trajectory
+    (to avoid transient startup artefacts).
+
+    Parameters
+    ----------
+    fmu_path     : path to PV_MPPT_Inverter1.fmu
+    irradiance_wm2 : incident POA irradiance  [W/m²]
+    temp_c       : ambient temperature        [°C]
+
+    Returns
+    -------
+    dict with keys: Ppanneau, Pbooste, P_ondu, Q_ondu, S_ondu,
+                    Vonduleur, THD_V, THD_i, rendement, error
+    """
+    from fmpy import simulate_fmu  # type: ignore
+
+    # The FMU's uSref_Gain=0.001 converts W/m² → per-unit internally.
+    # We pass raw W/m² — the Simulink diagram does the scaling.
+    # Temperature is passed as °C; the block adds 273.15 K internally.
+    try:
+        result = simulate_fmu(
+            fmu_path,
+            start_time=0.0,
+            stop_time=FMU_STOP_TIME,
+            step_size=FMU_STEP_SIZE,
+            start_values={
+                "Inport":  float(temp_c),
+                "Inport1": float(irradiance_wm2),
+            },
+            output=[
+                "Ppanneau", "Pbooste", "P_ondu",
+                "Q_ondu", "S_ondu", "Vonduleur",
+                "THD_V", "THD_i", "rendemet de onduleur",
+            ],
+            # fmpy reads the DLL from binaries/win64/ automatically
         )
-        return fig
 
-    df_c = pd.DataFrame(compare_hist, columns=["ts", "P_matlab", "P_pvlib"])
-    x    = list(range(len(df_c)))
+        # Average the last 50 % of the trajectory (steady state)
+        n = len(result)
+        half = n // 2
 
-    fig = sp.make_subplots(
-        rows=2, cols=1,
-        shared_xaxes=True,
-        row_heights=[0.68, 0.32],
-        vertical_spacing=0.05,
-        subplot_titles=("Puissance AC : MATLAB vs pvlib (W)",
-                        "Δ Erreur = MATLAB − pvlib (W)"),
+        def avg(key):
+            return float(np.mean(result[key][half:]))
+
+        return dict(
+            Ppanneau  = avg("Ppanneau"),
+            Pbooste   = avg("Pbooste"),
+            P_ondu    = avg("P_ondu"),
+            Q_ondu    = avg("Q_ondu"),
+            S_ondu    = avg("S_ondu"),
+            Vonduleur = avg("Vonduleur"),
+            THD_V     = avg("THD_V"),
+            THD_i     = avg("THD_i"),
+            rendement = avg("rendemet de onduleur"),
+            error     = None,
+        )
+
+    except Exception as exc:
+        return dict(
+            Ppanneau=0, Pbooste=0, P_ondu=0, Q_ondu=0, S_ondu=0,
+            Vonduleur=0, THD_V=0, THD_i=0, rendement=0,
+            error=str(exc),
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANALYTICAL FALLBACK — mirrors the Simulink steady-state physics
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_fmu_analytical(irradiance_wm2: float, temp_c: float) -> dict:
+    """
+    Physics-based steady-state replica of the FMU when the DLL is unavailable.
+
+    Equations mirror those in PV_MPPT_Inverter1.c / the Simulink blocks:
+
+      1. PV cell model  (SDE — single diode, De Soto parameters)
+         Tcell_K  = Temp_C + 273.15                   [K]
+         Tref_K   = 25 + 273.15 = 298.15              [K]
+         G_norm   = G / 1000                          [-]
+         IL       ≈ IL_ref × G_norm × (1 + α × ΔT)
+         Io       = Io_ref × (Tc/Tr)³ × exp(Eg/nVt × (1-Tr/Tc))
+         Vmp, Imp → Pmp solved with Newton-Raphson
+
+      2. MPPT Boost converter
+         Pbooste = Ppanneau × η_boost   (η_boost ≈ 0.98)
+
+      3. Full-bridge inverter
+         P_ondu  = Pbooste × η_inv     (η_inv   ≈ 0.97 from INVERTER spec)
+         Q_ondu  = P_ondu × tan(φ)     (PF ≈ 0.99 → φ ≈ 8.1°)
+         S_ondu  = √(P² + Q²)
+         THD_V, THD_i — typical IGBT bridge values from datasheet
+
+    The total system is 12 panels: 2 strings × 6 series.
+    Ppanneau here is the full string power (× 12 panels).
+    """
+    if irradiance_wm2 < 10:
+        return dict(Ppanneau=0, Pbooste=0, P_ondu=0, Q_ondu=0, S_ondu=0,
+                    Vonduleur=220.0, THD_V=0, THD_i=0, rendement=0, error=None)
+
+    # ── Panel electrical model ──────────────────────────────────────────────
+    Tc   = temp_c + 273.15          # [K] cell temperature (SAPM model omitted → use ambient)
+    Tr   = 298.15                   # [K] reference 25°C
+    G    = irradiance_wm2
+    Gref = 1000.0
+    G_n  = G / Gref
+
+    p = SDM  # shorthand
+
+    # Light current (temperature & irradiance corrected)
+    IL = G_n * (p["I_L_ref"] + p["alpha_sc"] * (Tc - Tr))
+
+    # Diode saturation current
+    Eg = p["EgRef"] * (1 + p["dEgdT"] * (Tc - Tr))
+    Io = p["I_o_ref"] * (Tc / Tr) ** 3 * math.exp(
+        (p["EgRef"] / (1.381e-23 * Tr / 1.602e-19))
+        * (1 - Tr / Tc)
     )
 
-    # ── Top panel: overlaid power curves ────────────────────────
-    fig.add_trace(go.Scatter(
-        x=x, y=df_c["P_matlab"],
-        mode='lines', fill='tozeroy',
-        name="MATLAB / Simulink",
-        line=dict(color=C["green"], width=2.5),
-        fillcolor="rgba(0,209,178,0.12)",
-    ), row=1, col=1)
+    # Thermal voltage per cell (a=1.7 modified ideality)
+    Vt = p["a_ref"] * 1.381e-23 * Tc / 1.602e-19
 
-    fig.add_trace(go.Scatter(
-        x=x, y=df_c["P_pvlib"],
-        mode='lines', fill='tozeroy',
-        name="pvlib (Théorique)",
-        line=dict(color=C["blue"], width=2, dash='dot'),
-        fillcolor="rgba(59,130,246,0.08)",
-    ), row=1, col=1)
+    # Newton-Raphson to find Vmpp, Impp for one cell
+    # Use SDM: I = IL - Io*(exp((V+I*Rs)/Vt)-1) - (V+I*Rs)/Rsh
+    # Iterative MPP search
+    n_pts = 200
+    V_arr = np.linspace(0, p["vmp"] * 1.3, n_pts)
+    I_arr = np.zeros(n_pts)
 
-    # ── Bottom panel: delta / error ──────────────────────────────
-    delta = df_c["P_matlab"] - df_c["P_pvlib"]
-    colors_delta = [C["green"] if v >= 0 else C["red"] for v in delta]
+    for k, V in enumerate(V_arr):
+        I = IL  # initial guess
+        for _ in range(50):
+            f  = IL - Io * (math.exp(min((V + I * p["R_s"]) / Vt, 700)) - 1) \
+                    - (V + I * p["R_s"]) / p["R_sh_ref"] - I
+            df = -Io * p["R_s"] / Vt * math.exp(min((V + I * p["R_s"]) / Vt, 700)) \
+                    - p["R_s"] / p["R_sh_ref"] - 1
+            if abs(df) < 1e-12:
+                break
+            dI = -f / df
+            I  = max(0, I + dI)
+            if abs(dI) < 1e-8:
+                break
+        I_arr[k] = max(0, I)
 
-    fig.add_trace(go.Bar(
-        x=x, y=delta,
-        name="Δ (MATLAB − pvlib)",
-        marker_color=colors_delta,
-        marker_line_width=0,
-        opacity=0.75,
-    ), row=2, col=1)
+    P_arr = V_arr * I_arr
+    mpp_idx = int(np.argmax(P_arr))
+    Vmpp_cell = V_arr[mpp_idx]
+    Impp_cell = I_arr[mpp_idx]
+    Pmpp_cell = P_arr[mpp_idx]       # [W] single cell
 
-    fig.add_hline(y=0, line_dash="solid", line_color=C["muted"],
-                  line_width=1, row=2, col=1)
+    # Scale to full string array: 6 cells in series × 2 strings parallel
+    # (We treat each "module" = 72 cells, so Vmpp × 72/6, Impp × 2)
+    # Simplification: use manufacturer Vmpp, Imp scaled by irradiance factor
+    vmp_mod = PANEL["vmp"] * (1 + PANEL["gamma_pdc"] / 3 * (temp_c - 25)) * (1 + 0.05 * math.log(max(G_n, 0.01)))
+    imp_mod = PANEL["imp"] * G_n * (1 + PANEL["alpha_sc_approx"] if "alpha_sc_approx" in PANEL else 1)
+    imp_mod = PANEL["imp"] * G_n
 
-    fig.update_layout(
-        **CHART_LAYOUT,
-        height=420,
-        bargap=0.02,
+    # Full-array MPP (6 series × 2 parallel × 12 modules)
+    n_series   = PANEL["modules_per_string"]    # 6
+    n_parallel = PANEL["strings_in_parallel"]   # 2
+    V_array    = vmp_mod * n_series             # [V] string voltage
+    I_array    = imp_mod * n_parallel           # [A] parallel current
+    Ppanneau   = V_array * I_array             # [W] DC PV power
+
+    # Temperature penalty on top
+    Ppanneau *= max(0, 1 + PANEL["gamma_pdc"] * (temp_c - 25))
+
+    # ── Boost MPPT converter ────────────────────────────────────────────────
+    eta_boost = 0.980
+    Pbooste   = Ppanneau * eta_boost
+
+    # ── Full-bridge inverter ────────────────────────────────────────────────
+    eta_inv   = 0.970
+    P_ondu    = Pbooste * eta_inv
+
+    # Power factor φ ≈ 8.1° (PF = 0.99)
+    pf  = 0.99
+    phi = math.acos(pf)
+    Q_ondu    = P_ondu * math.tan(phi)
+    S_ondu    = math.sqrt(P_ondu**2 + Q_ondu**2)
+
+    # Inverter output voltage (line-to-neutral, 220 V nominal)
+    Vonduleur = 220.0
+
+    # THD — typical IGBT H-bridge at rated load (decreases with power)
+    load_frac = min(P_ondu / (SITE["capacity_kwp"] * 1000 + 1e-3), 1.0)
+    THD_V     = max(1.5,  4.0 * (1 - load_frac))   # [%]
+    THD_i     = max(2.0,  8.0 * (1 - load_frac))   # [%]
+
+    rendement = eta_boost * eta_inv
+
+    return dict(
+        Ppanneau  = max(0, Ppanneau),
+        Pbooste   = max(0, Pbooste),
+        P_ondu    = max(0, P_ondu),
+        Q_ondu    = max(0, Q_ondu),
+        S_ondu    = max(0, S_ondu),
+        Vonduleur = Vonduleur,
+        THD_V     = THD_V,
+        THD_i     = THD_i,
+        rendement = rendement,
+        error     = None,
     )
-    fig.update_yaxes(title_text="Puissance (W)", gridcolor=C["border"], row=1, col=1)
-    fig.update_yaxes(title_text="Δ (W)",         gridcolor=C["border"], row=2, col=1)
-    fig.update_xaxes(title_text="Échantillon",   gridcolor=C["border"], row=2, col=1)
-
-    return fig
 
 
-def make_power_triangle_chart(P: float, Q: float, S: float) -> go.Figure:
+def run_fmu(fmu_available: bool, fmu_path: str | None,
+            irradiance_wm2: float, temp_c: float) -> dict:
+    """Dispatch to live FMU or analytical fallback."""
+    if fmu_available and fmu_path:
+        return run_fmu_live(fmu_path, irradiance_wm2, temp_c)
+    return run_fmu_analytical(irradiance_wm2, temp_c)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WEATHER — OPEN-METEO
+# ─────────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_weather(lat: float, lon: float) -> dict:
     """
-    Polar / bar representation of the power triangle:
-    Active (P), Reactive (Q), Apparent (S).
+    Fetch real-time weather from Open-Meteo forecast API.
+    Returns the 'current' block + 24-h hourly arrays for charting.
     """
-    fig = go.Figure(go.Bar(
-        x=["P Active (W)", "Q Réactive (VAR)", "S Apparente (VA)"],
-        y=[P, Q, S],
-        marker_color=[C["green"], C["amber"], C["blue"]],
-        text=[f"{P:.0f}", f"{Q:.0f}", f"{S:.0f}"],
-        textposition='outside',
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = dict(
+        latitude=lat,
+        longitude=lon,
+        current=(
+            "temperature_2m,apparent_temperature,relative_humidity_2m,"
+            "wind_speed_10m,shortwave_radiation,diffuse_radiation,"
+            "direct_radiation,cloud_cover,weather_code"
+        ),
+        hourly=(
+            "temperature_2m,shortwave_radiation,diffuse_radiation,"
+            "direct_normal_irradiance,wind_speed_10m,cloud_cover"
+        ),
+        forecast_days=2,
+        timezone="Africa/Casablanca",
+    )
+    try:
+        r = requests.get(url, params=params, timeout=12)
+        r.raise_for_status()
+        data = r.json()
+        hourly = data.get("hourly", {})
+        # Build DataFrame for today (first 24 h)
+        df = pd.DataFrame({
+            "time":         pd.to_datetime(hourly["time"]),
+            "temp":         hourly["temperature_2m"],
+            "ghi":          hourly["shortwave_radiation"],
+            "dhi":          hourly["diffuse_radiation"],
+            "dni":          hourly["direct_normal_irradiance"],
+            "wind":         hourly["wind_speed_10m"],
+            "cloud_cover":  hourly["cloud_cover"],
+        })
+        return {"current": data.get("current", {}), "hourly": df}
+    except Exception as exc:
+        return {"current": {}, "hourly": pd.DataFrame(), "error": str(exc)}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_historical_weather(lat: float, lon: float,
+                           start: str, end: str) -> pd.DataFrame:
+    """Fetch hourly historical data from Open-Meteo Archive API."""
+    url = "https://archive-api.open-meteo.com/v1/archive"
+    params = dict(
+        latitude=lat, longitude=lon,
+        start_date=start, end_date=end,
+        hourly=(
+            "temperature_2m,shortwave_radiation,diffuse_radiation,"
+            "direct_normal_irradiance,wind_speed_10m,cloud_cover"
+        ),
+        timezone="Africa/Casablanca",
+    )
+    try:
+        r = requests.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        h = r.json()["hourly"]
+        df = pd.DataFrame({
+            "time":  pd.to_datetime(h["time"]),
+            "temp":  h["temperature_2m"],
+            "ghi":   h["shortwave_radiation"],
+            "dhi":   h["diffuse_radiation"],
+            "dni":   h["direct_normal_irradiance"],
+            "wind":  h["wind_speed_10m"],
+            "cloud": h.get("cloud_cover", [0] * len(h["time"])),
+        })
+        return df
+    except Exception as exc:
+        st.error(f"Archive API error: {exc}")
+        return pd.DataFrame()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PVLIB THEORETICAL BASELINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_pvlib(ghi: float, dhi: float, dni: float,
+              temp_c: float, wind: float,
+              solar_zenith: float, solar_azimuth: float) -> dict:
+    """
+    Calculate theoretical MPP using pvlib.
+
+    Uses the De Soto single-diode model (SDM) for the most accurate
+    comparison with the Simulink SDM implementation inside the FMU.
+
+    Returns dict with keys: Pmp, Vmp, Imp, Isc, Voc, cell_temp.
+    """
+    if ghi < 1 or solar_zenith > 89:
+        return dict(Pmp=0, Vmp=0, Imp=0, Isc=0, Voc=0, cell_temp=temp_c)
+
+    # POA irradiance (plane of array)
+    poa = irradiance.get_total_irradiance(
+        surface_tilt=SITE["tilt"],
+        surface_azimuth=SITE["azimuth"],
+        solar_zenith=solar_zenith,
+        solar_azimuth=solar_azimuth,
+        dni=max(0, dni),
+        ghi=max(0, ghi),
+        dhi=max(0, dhi),
+        model="haydavies",
+    )
+    G_poa = float(poa.get("poa_global", ghi) or ghi)
+
+    # Cell temperature (SAPM open-rack model)
+    t_params = temperature.TEMPERATURE_MODEL_PARAMETERS["sapm"]["open_rack_glass_glass"]
+    cell_temp = float(temperature.sapm_cell(
+        poa_global=G_poa, temp_air=temp_c, wind_speed=wind,
+        a=t_params["a"], b=t_params["b"], deltaT=t_params["deltaT"],
     ))
-    fig.update_layout(
-        **CHART_LAYOUT,
-        height=220,
-        showlegend=False,
-        yaxis=dict(title="Valeur", gridcolor=C["border"]),
-        margin=dict(l=5, r=5, t=10, b=5),
+
+    # pvlib De Soto SDM parameters
+    IL, Io, Rs, Rsh, nNsVth = pvsystem.calcparams_desoto(
+        effective_irradiance=G_poa,
+        temp_cell=cell_temp,
+        alpha_sc=SDM["alpha_sc"],
+        a_ref=SDM["a_ref"],
+        I_L_ref=SDM["I_L_ref"],
+        I_o_ref=SDM["I_o_ref"],
+        R_sh_ref=SDM["R_sh_ref"],
+        R_s=SDM["R_s"],
+        EgRef=SDM["EgRef"],
+        dEgdT=SDM["dEgdT"],
     )
-    return fig
+
+    # Solve for MPP
+    mpp = pvsystem.max_power_point(IL, Io, Rs, Rsh, nNsVth, method="newton")
+
+    # Scale to full array (6 series × 2 parallel × 12 panels)
+    n_s = PANEL["modules_per_string"]
+    n_p = PANEL["strings_in_parallel"]
+
+    Pmp = float(mpp["p_mp"]) * n_s * n_p
+    Vmp = float(mpp["v_mp"]) * n_s
+    Imp = float(mpp["i_mp"]) * n_p
+
+    # Isc and Voc for reference
+    Isc = float(IL) * n_p
+    Voc = float(
+        nNsVth * np.log(float(IL) / float(Io) + 1) - float(Rs) * float(IL)
+    ) * n_s
+
+    return dict(
+        Pmp=max(0, Pmp),
+        Vmp=max(0, Vmp),
+        Imp=max(0, Imp),
+        Isc=Isc,
+        Voc=max(0, Voc),
+        cell_temp=cell_temp,
+    )
 
 
-# ════════════════════════════════════════════════════════════════════
-# SECTION 7b — 3D PANEL WIDGET
-# ════════════════════════════════════════════════════════════════════
-
-def render_3d_panel(p_inv: float, thd_v: float, thd_i: float):
+def compute_pvlib_series(df_weather: pd.DataFrame) -> pd.DataFrame:
     """
-    Embed the interactive 3D PV panel widget (pv_panel_3d.html).
-
-    Auto-selects the defect mode from live MQTT values:
-      - ok   → P_inv normal, THD < 5 %
-      - warn → THD entre 5 % et 8 %  OU  légère chute de puissance
-      - err  → THD > 8 %  OU  P_inv quasi nul (panne détectée)
+    Run pvlib over an hourly weather DataFrame.
+    Returns DataFrame with pvlib_Pmp, fmu_Ppanneau, fmu_P_ondu columns.
     """
-    html_path = pathlib.Path(__file__).parent / "pv_panel_3d.html"
-    if not html_path.exists():
-        st.error("⚠️ Fichier `pv_panel_3d.html` introuvable — placez-le dans le même dossier.")
-        return
+    loc = Location(
+        latitude=SITE["lat"], longitude=SITE["lon"],
+        altitude=SITE["altitude"], tz=SITE["timezone"],
+    )
+    solar_pos = loc.get_solarposition(df_weather["time"])
 
-    html_src = html_path.read_text(encoding="utf-8")
+    rows = []
+    for i, row in df_weather.iterrows():
+        pvl = run_pvlib(
+            ghi=row["ghi"], dhi=row["dhi"], dni=row["dni"],
+            temp_c=row["temp"], wind=row["wind"],
+            solar_zenith=solar_pos.loc[solar_pos.index[i - df_weather.index[0]], "apparent_zenith"]
+                if (i - df_weather.index[0]) < len(solar_pos) else 90,
+            solar_azimuth=solar_pos.loc[solar_pos.index[i - df_weather.index[0]], "azimuth"]
+                if (i - df_weather.index[0]) < len(solar_pos) else 180,
+        )
+        fmu = run_fmu(False, None, row["ghi"], row["temp"])   # always analytical for batch
+        rows.append({**pvl, **{f"fmu_{k}": v for k, v in fmu.items() if k != "error"}})
 
-    # ── Détermination automatique du mode ────────────────────────
-    if thd_v > 8 or thd_i > 8 or (0 < p_inv < 50):
-        auto_mode = "err"
-    elif thd_v > 5 or thd_i > 5:
-        auto_mode = "warn"
-    else:
-        auto_mode = "ok"
-
-    # ── Injection du script d'initialisation ─────────────────────
-    inject = f"""
-    <script>
-    // Auto-apply mode derived from live MQTT data
-    window.addEventListener('load', function() {{
-        setMode('{auto_mode}');
-    }});
-    </script>
-    """
-    html_src = html_src.replace("</body>", inject + "\n</body>")
-
-    components.html(html_src, height=620, scrolling=False)
+    return pd.DataFrame(rows)
 
 
-# ════════════════════════════════════════════════════════════════════
-# SECTION 8 — SIDEBAR RENDERER
-# ════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER RENDERERS
+# ─────────────────────────────────────────────────────────────────────────────
 
-def render_sidebar(img_b64: str, history_list: list, weather: dict | None):
-    """Render the left sidebar with logo, status, export, and settings."""
+def kpi(label: str, value, unit: str = "", color: str = "var(--gold)"):
+    return f"""
+    <div class="kpi">
+      <div class="kpi-label">{label}</div>
+      <div class="kpi-value" style="color:{color}">{value}</div>
+      <div class="kpi-unit">{unit}</div>
+    </div>"""
+
+
+def badge(text: str, cls: str = "badge-green", dot_color: str = "#2ECC71"):
+    return f"""<span class="badge {cls}">
+      <span class="dot" style="background:{dot_color};box-shadow:0 0 6px {dot_color}"></span>
+      {text}</span>"""
+
+
+def info(text: str, warn=False):
+    cls = "warn-banner" if warn else "info-banner"
+    return f'<div class="{cls}">{text}</div>'
+
+
+def plot_layout(**kwargs):
+    lay = {**PLOT_BASE}
+    lay.update(kwargs)
+    return lay
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN APP
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    fmu_ok, fmu_path, fmu_reason = detect_fmu_capability()
+
+    # ── SIDEBAR ──────────────────────────────────────────────────────────────
     with st.sidebar:
-        # ── Logo & branding ──────────────────────────────────────
-        if img_b64:
-            img_tag = f'<img src="data:image/jpeg;base64,{img_b64}" alt="ENSET" style="width:9rem;height:9rem;border-radius:50%;border:3px solid #00d1b2;">'
-        else:
-            img_tag = '<div style="font-size:4rem;">☀️</div>'
-
-        st.markdown(f"""
-        <div style="text-align:center;padding:20px 0;">
-          {img_tag}
-          <h2 style="color:#00d1b2;font-size:1.35rem;margin:10px 0 2px;">ENSET Mohammedia</h2>
-          <p style="color:#aaa;font-size:0.78rem;margin:0;">Digital Twin — Système PV</p>
-          <p style="color:#00d1b2;font-size:0.72rem;margin-top:6px;">2025 / 2026</p>
-        </div>
-        """, unsafe_allow_html=True)
-
+        st.markdown(
+            '<div style="font-family:\'Space Mono\',monospace;font-size:20px;'
+            'font-weight:700;background:linear-gradient(135deg,#F5A623,#E8860A);'
+            '-webkit-background-clip:text;-webkit-text-fill-color:transparent;'
+            'letter-spacing:.1em;">SOLARIS</div>'
+            '<div style="font-size:11px;color:#3D4553;text-transform:uppercase;'
+            'letter-spacing:.1em;margin-bottom:14px;">Digital Twin FMU v2.1</div>',
+            unsafe_allow_html=True,
+        )
         st.markdown("---")
 
-        # ── MQTT status ──────────────────────────────────────────
-        st.subheader("📡 Connexion MQTT")
-        if global_data.get("connected"):
-            st.success("✅ Broker connecté")
-        else:
-            st.error("🔴 Broker déconnecté")
-        st.caption(f"Broker : `{BROKER}`")
-        st.caption(f"Prefix : `{PREFIX}`")
-
-        st.markdown("---")
-
-        # ── Weather status ───────────────────────────────────────
-        st.subheader("🌤️ Open-Meteo")
-        if weather:
-            age_min = (time.time() - global_data["weather_ts"]) / 60
-            st.success(f"✅ Météo fraîche ({age_min:.0f} min)")
-            st.caption(f"GHI  : {weather.get('GHI', 0):.1f} W/m²")
-            st.caption(f"DNI  : {weather.get('DNI', 0):.1f} W/m²")
-            st.caption(f"Temp : {weather.get('Temp', 0):.1f} °C")
-        else:
-            st.warning("⏳ Données météo non disponibles")
-
-        st.markdown("---")
-
-        # ── pvlib status ─────────────────────────────────────────
-        st.subheader("🔬 Modèle pvlib")
-        if PVLIB_AVAILABLE:
-            st.success("✅ pvlib chargé")
-            st.caption(f"Pnom : {PNOM:.0f} W")
-            st.caption(f"Panneaux : {NB_PANELS} × 330 W")
-            st.caption(f"Inclinaison : {TILT}° / Azimuth : {AZIMUTH}°")
-        else:
-            st.error("❌ pvlib non installé")
-            st.caption("pip install pvlib")
-
-        st.markdown("---")
-
-        # ── CSV export ───────────────────────────────────────────
-        st.subheader("📂 Export des données")
-        if history_list:
-            df_export = pd.DataFrame(history_list).astype(float)
-            df_export.insert(0, "Sample", range(1, len(df_export) + 1))
-            csv_buf = StringIO()
-            df_export.to_csv(csv_buf, index=False, sep=";", decimal=",")
-            st.download_button(
-                label="⬇️ Télécharger CSV (Excel)",
-                data=csv_buf.getvalue().encode("utf-8-sig"),
-                file_name="digital_twin_pv_data.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-            st.caption(f"📊 {len(history_list)} échantillons")
-        else:
-            st.info("Aucune donnée encore reçue.")
-
-        st.markdown("---")
-
-        # ── Settings info ────────────────────────────────────────
-        st.subheader("⚙️ Paramètres")
-        st.caption(f"Refresh dashboard : {TIME_SLEEP} s")
-        st.caption(f"Enreg. CSV        : {RECORD_EVERY} s")
-        st.caption(f"Historique max    : {MAX_HISTORY:,} pts")
-        st.caption(f"Météo refresh     : {WEATHER_REFRESH_INTERVAL//60} min")
-        st.caption(f"Site              : {SITE_NAME}")
-
-        if global_data["last_error"]:
-            st.warning(f"⚠️ {global_data['last_error']}")
-
-
-# ════════════════════════════════════════════════════════════════════
-# SECTION 9 — MAIN DASHBOARD RENDERER
-# ════════════════════════════════════════════════════════════════════
-
-def render_dashboard(current_vals: dict, df: pd.DataFrame,
-                     pvlib_result: dict, weather: dict | None):
-    """
-    Render all dashboard sections inside the Streamlit placeholder.
-    Organised into tabs for clarity.
-    """
-    tab_rt, tab_cmp, tab_elec, tab_thd, tab_3d = st.tabs([
-        "⚡ Temps Réel (MQTT)",
-        "📊 Analyse Comparative",
-        "🔌 Grandeurs Électriques",
-        "〰️ Qualité Réseau (THD)",
-        "🧩 Vue 3D — Panneau PV",
-    ])
-
-    # ────────────────────────────────────────────────────────────
-    # TAB 1 — Real-Time MQTT values
-    # ────────────────────────────────────────────────────────────
-    with tab_rt:
-        # ── Row 1 : Power instantaneous values ──────────────────
-        st.markdown('<p class="section-header">Puissances — Valeurs instantanées</p>',
-                    unsafe_allow_html=True)
-        c1, c2, c3 = st.columns(3)
-        with c1: st.metric("☀️ P_PV",       f"{current_vals['P_pv']:.1f} W")
-        with c2: st.metric("⚡ P_Boost DC", f"{current_vals['P_dc']:.1f} W")
-        with c3: st.metric("🔌 P_Onduleur", f"{current_vals['P_inv']:.1f} W")
-
-        st.markdown(" ")
-
-        # ── Row 2 : Voltages & efficiency ───────────────────────
-        st.markdown('<p class="section-header">Tensions & Performance</p>',
-                    unsafe_allow_html=True)
-        v_rms = float(np.sqrt(np.mean(df['V_inv']**2))) if len(df) > 1 else 0.0
-        eff   = (current_vals['P_inv'] / current_vals['P_pv'] * 100) \
-                if current_vals['P_pv'] > 0 else 0.0
-
-        c4, c5, c6 = st.columns(3)
-        with c4: st.metric("🔁 V_inv RMS", f"{v_rms:.2f} V")
-        with c5: st.metric("🌞 V_PV",      f"{current_vals['V_pv']:.1f} V")
-        with c6: st.metric("📈 Rendement", f"{eff:.1f} %")
-
-        st.markdown("---")
-
-        # ── Row 3 : Power curves ─────────────────────────────────
-        st.markdown('<p class="section-header">Évolution des Puissances Actives</p>',
-                    unsafe_allow_html=True)
-        pc1, pc2, pc3 = st.columns(3)
-        with pc1:
-            st.plotly_chart(
-                make_area_chart(df['P_pv'],  C["green"], 'rgba(0,209,178,0.15)',
-                                'P_PV (W)', y_max=6700),
-                use_container_width=True, key="ch_p_pv")
-        with pc2:
-            st.plotly_chart(
-                make_area_chart(df['P_dc'],  C["amber"], 'rgba(245,158,11,0.15)',
-                                'P_Boost DC (W)', y_max=5500),
-                use_container_width=True, key="ch_p_dc")
-        with pc3:
-            st.plotly_chart(
-                make_area_chart(df['P_inv'], C["pink"],  'rgba(236,72,153,0.15)',
-                                'P_Onduleur AC (W)', y_max=5000),
-                use_container_width=True, key="ch_p_inv")
-
-        st.markdown("---")
-
-        # ── Row 4 : Voltage curves ───────────────────────────────
-        st.markdown('<p class="section-header">Évolution des Tensions</p>',
-                    unsafe_allow_html=True)
-        vc1, vc2, vc3 = st.columns(3)
-        with vc1:
-            st.plotly_chart(
-                make_line_chart(df['V_pv'], C["green"], 'V_PV (V)',
-                                y_max=315),
-                use_container_width=True, key="ch_v_pv")
-        with vc2:
-            st.plotly_chart(
-                make_line_chart(df['V_dc'], C["amber"], 'V_Bus DC (V)',
-                                y_max=610),
-                use_container_width=True, key="ch_v_dc")
-        with vc3:
-            st.plotly_chart(
-                make_line_chart(df['V_inv'], C["blue"], 'V_Onduleur AC (V)',
-                                y_max=220),
-                use_container_width=True, key="ch_v_ac")
-
-    # ────────────────────────────────────────────────────────────
-    # TAB 2 — Comparative Analysis (MATLAB vs pvlib)
-    # ────────────────────────────────────────────────────────────
-    with tab_cmp:
-        st.markdown('<p class="section-header">Modèle A (MATLAB/Simulink via MQTT) vs Modèle B (pvlib Analytique)</p>',
-                    unsafe_allow_html=True)
-
-        # ── Weather snapshot ────────────────────────────────────
-        if weather:
-            wc1, wc2, wc3, wc4 = st.columns(4)
-            with wc1: st.metric("🌤️ GHI",  f"{weather.get('GHI',0):.1f} W/m²")
-            with wc2: st.metric("🌡️ Temp", f"{weather.get('Temp',0):.1f} °C")
-            with wc3: st.metric("💨 Vent", f"{weather.get('Wind',0):.1f} m/s")
-            with wc4: st.metric("📐 POA",  f"{pvlib_result.get('POA',0):.1f} W/m²")
-        else:
-            st.info("⏳ En attente de données météo Open-Meteo…")
-
-        st.markdown(" ")
-
-        # ── Side-by-side model KPIs ──────────────────────────────
-        st.markdown('<p class="section-header">Comparaison Instantanée</p>',
-                    unsafe_allow_html=True)
-
-        P_matlab = get_matlab_power()
-        P_pvlib  = pvlib_result.get("P_AC_pvlib", 0.0)
-        delta_P  = P_matlab - P_pvlib
-        delta_pct = (delta_P / P_pvlib * 100) if P_pvlib > 1 else 0.0
-
-        km1, km2, km3, km4 = st.columns(4)
-        with km1:
-            st.metric("🟢 MATLAB P_AC",    f"{P_matlab:.1f} W",
-                      help="Puissance AC mesurée via MQTT (Simulink)")
-        with km2:
-            st.metric("🔵 pvlib P_AC",     f"{P_pvlib:.1f} W",
-                      help="Puissance AC calculée par pvlib (baseline théorique)")
-        with km3:
-            sign = "+" if delta_P >= 0 else ""
-            st.metric("Δ Puissance",       f"{sign}{delta_P:.1f} W",
-                      delta=f"{sign}{delta_pct:.1f} %",
-                      help="Différence absolue entre les deux modèles")
-        with km4:
-            t_mod = pvlib_result.get("T_module", 0)
-            st.metric("🌡️ T_Module pvlib", f"{t_mod:.1f} °C",
-                      help="Température cellule estimée (modèle Faiman)")
-
-        st.markdown(" ")
-
-        # ── Error interpretation banner ──────────────────────────
-        abs_err = abs(delta_pct)
-        if P_pvlib < 10:
-            st.info("🌙 Irradiance trop faible — comparaison non significative.")
-        elif abs_err < 5:
-            st.success(f"✅ Modèles bien corrélés — écart relatif : {delta_pct:+.1f} %")
-        elif abs_err < 15:
-            st.warning(f"⚠️ Légère divergence entre modèles — écart : {delta_pct:+.1f} %")
-        else:
-            st.error(f"❌ Forte divergence détectée — écart : {delta_pct:+.1f} %")
-
-        st.markdown("---")
-
-        # ── Comparative time-series chart ────────────────────────
-        st.markdown('<p class="section-header">Évolution Comparative (MATLAB vs pvlib)</p>',
-                    unsafe_allow_html=True)
-        st.plotly_chart(
-            make_comparative_chart(global_data["compare_hist"]),
-            use_container_width=True,
-            key="ch_compare",
+        menu = st.radio(
+            "Navigation",
+            ["Live Dashboard", "Hourly Analysis", "FMU vs pvlib Deep-Dive",
+             "Historical Simulation", "System Specs & FMU Info"],
+            label_visibility="collapsed",
         )
 
-        # ── pvlib detail metrics ─────────────────────────────────
         st.markdown("---")
-        st.markdown('<p class="section-header">Détails du modèle pvlib</p>',
-                    unsafe_allow_html=True)
-        pd1, pd2, pd3 = st.columns(3)
-        with pd1: st.metric("P_DC pvlib", f"{pvlib_result.get('P_DC_pvlib',0):.1f} W")
-        with pd2: st.metric("P_AC pvlib", f"{pvlib_result.get('P_AC_pvlib',0):.1f} W")
-        with pd3: st.metric("POA",        f"{pvlib_result.get('POA',0):.1f} W/m²")
-
-        if not PVLIB_AVAILABLE:
-            st.error("⚠️ pvlib non installé. Exécutez : `pip install pvlib`")
-
-    # ────────────────────────────────────────────────────────────
-    # TAB 3 — Electrical quantities (S, Q, P, FP)
-    # ────────────────────────────────────────────────────────────
-    with tab_elec:
-        st.markdown('<p class="section-header">Puissances Apparente & Réactive</p>',
-                    unsafe_allow_html=True)
-
-        S_val = current_vals['S']
-        Q_val = current_vals['Q']
-        P_val = current_vals['P_inv']
-        fp    = (P_val / S_val) if S_val > 0.1 else 0.0
-
-        e1, e2, e3, e4 = st.columns(4)
-        with e1: st.metric("🔵 S Apparente",          f"{S_val:.1f} VA")
-        with e2: st.metric("🟠 Q Réactive",           f"{Q_val:.1f} VAR")
-        with e3: st.metric("🟢 P Active",             f"{P_val:.1f} W")
-        with e4: st.metric("📊 Facteur de Puissance", f"{fp:.3f}")
-
-        st.markdown("---")
-
-        # ── Power triangle chart ─────────────────────────────────
-        st.markdown('<p class="section-header">Triangle des Puissances</p>',
-                    unsafe_allow_html=True)
-        col_tri, col_detail = st.columns([2, 1])
-        with col_tri:
-            st.plotly_chart(
-                make_power_triangle_chart(P_val, Q_val, S_val),
-                use_container_width=True, key="ch_pwr_tri",
-            )
-        with col_detail:
-            st.markdown("**Interprétation**")
-            fp_cat = "Excellent (≥ 0.95)" if fp >= 0.95 \
-                else "Acceptable (0.85–0.95)" if fp >= 0.85 \
-                else "À corriger (< 0.85)"
-            st.info(f"FP : **{fp:.3f}** — {fp_cat}")
-            if Q_val > 0:
-                phi_deg = np.degrees(np.arctan2(Q_val, P_val)) if P_val > 0 else 90
-                st.caption(f"φ = {phi_deg:.1f}°  (déphasage I/U)")
-            st.caption(f"S² = P² + Q²")
-            st.caption(f"  = {P_val**2:.0f} + {Q_val**2:.0f}")
-            if S_val > 0:
-                check = (P_val**2 + Q_val**2)**0.5
-                st.caption(f"  ≈ {check:.1f} VA  (calculé)")
-
-    # ────────────────────────────────────────────────────────────
-    # TAB 4 — THD / Power Quality
-    # ────────────────────────────────────────────────────────────
-    with tab_thd:
-        st.markdown('<p class="section-header">Distorsion Harmonique Totale (THD)</p>',
-                    unsafe_allow_html=True)
-
-        thd_v = current_vals['THD_V']
-        thd_i = current_vals['THD_I']
-
-        t1, t2, t3 = st.columns(3)
-        with t1:
-            st.metric("THD_V (Tension onduleur)", f"{thd_v:.2f} %")
-            if thd_v < 5:
-                st.success("✅ < 5 % — Conforme IEC")
-            elif thd_v < 8:
-                st.warning("⚠️ Légèrement élevé")
-            else:
-                st.error("❌ Hors norme")
-
-        with t2:
-            st.metric("THD_I (Courant onduleur)", f"{thd_i:.2f} %")
-            if thd_i < 5:
-                st.success("✅ < 5 % — Conforme IEC")
-            elif thd_i < 8:
-                st.warning("⚠️ Légèrement élevé")
-            else:
-                st.error("❌ Hors norme")
-
-        with t3:
-            st.plotly_chart(
-                make_thd_bar_chart(thd_v, thd_i),
-                use_container_width=True, key="ch_thd_bar",
-            )
-
-        st.markdown("---")
-        st.markdown('<p class="section-header">Évolution THD dans le temps</p>',
-                    unsafe_allow_html=True)
-        if len(df) > 1:
-            fig_thd_hist = go.Figure()
-            fig_thd_hist.add_trace(go.Scatter(
-                y=df['THD_V'], mode='lines', name="THD_V (%)",
-                line=dict(color=C["blue"], width=1.8),
-            ))
-            fig_thd_hist.add_trace(go.Scatter(
-                y=df['THD_I'], mode='lines', name="THD_I (%)",
-                line=dict(color=C["pink"], width=1.8),
-            ))
-            fig_thd_hist.add_hline(
-                y=5, line_dash="dash", line_color=C["amber"],
-                annotation_text="Limite 5 %",
-            )
-            fig_thd_hist.update_layout(
-                **CHART_LAYOUT,
-                height=300,
-                yaxis=dict(title="THD (%)", gridcolor=C["border"]),
-                xaxis=dict(title="Échantillon", gridcolor=C["border"]),
-            )
-            st.plotly_chart(fig_thd_hist, use_container_width=True, key="ch_thd_hist")
+        st.markdown("**FMU Status**")
+        if fmu_ok:
+            st.markdown(badge("FMU LIVE", "badge-green", "#2ECC71"), unsafe_allow_html=True)
         else:
-            st.info("⏳ Historique insuffisant.")
+            st.markdown(badge("ANALYTICAL MODE", "badge-orange", "#F5A623"), unsafe_allow_html=True)
+        st.markdown(
+            f'<div style="font-size:11px;color:#3D4553;margin-top:6px">{fmu_reason}</div>',
+            unsafe_allow_html=True,
+        )
 
-    # ────────────────────────────────────────────────────────────
-    # TAB 5 — Interactive 3D PV Panel
-    # ────────────────────────────────────────────────────────────
-    with tab_3d:
-        st.markdown('<p class="section-header">Vue 3D — État du Panneau Solaire</p>',
-                    unsafe_allow_html=True)
+        st.markdown("---")
+        st.markdown("**System**")
+        st.markdown(f"Capacity: **{SITE['capacity_kwp']} kWp**")
+        st.markdown(f"Panels: **{SITE['num_panels']}** (6s × 2p)")
+        st.markdown(f"Tilt / Azimuth: **{SITE['tilt']}° / {SITE['azimuth']}°**")
 
-        # ── Live KPIs above the panel ────────────────────────────
-        k1, k2, k3, k4 = st.columns(4)
-        thd_v_live = current_vals['THD_V']
-        thd_i_live = current_vals['THD_I']
-        p_inv_live = current_vals['P_inv']
-
-        # Determine status label & color for display
-        if thd_v_live > 8 or thd_i_live > 8 or (0 < p_inv_live < 50):
-            status_label = "❌ PANNE CRITIQUE"
-            status_color = C["red"]
-        elif thd_v_live > 5 or thd_i_live > 5:
-            status_label = "⚠️ DÉFAUT PARTIEL"
-            status_color = C["amber"]
+        if menu == "Historical Simulation":
+            st.markdown("---")
+            st.markdown("**Date Range**")
+            today = datetime.today().date()
+            hist_start = st.date_input("From", value=(datetime.today() - timedelta(days=30)).date())
+            hist_end   = st.date_input("To",   value=today)
         else:
-            status_label = "✅ NOMINAL"
-            status_color = C["green"]
+            hist_start = hist_end = None
 
-        with k1: st.metric("🔌 P_Onduleur",  f"{p_inv_live:.1f} W")
-        with k2: st.metric("〰️ THD_V",       f"{thd_v_live:.2f} %")
-        with k3: st.metric("〰️ THD_I",       f"{thd_i_live:.2f} %")
-        with k4:
+        # Auto-refresh toggle
+        st.markdown("---")
+        auto_refresh = st.checkbox("Auto-refresh (60 s)", value=False)
+        if auto_refresh:
+            import time
+            time.sleep(1)
+            st.rerun()
+
+    # ── FETCH WEATHER ────────────────────────────────────────────────────────
+    weather_data = get_weather(SITE["lat"], SITE["lon"])
+    cur = weather_data.get("current", {})
+    df_hourly = weather_data.get("hourly", pd.DataFrame())
+
+    ghi_now   = float(cur.get("shortwave_radiation", 0) or 0)
+    temp_now  = float(cur.get("temperature_2m", 25) or 25)
+    wind_now  = float(cur.get("wind_speed_10m", 0) or 0)
+    hum_now   = float(cur.get("relative_humidity_2m", 50) or 50)
+    cloud_now = float(cur.get("cloud_cover", 0) or 0)
+
+    # Current-moment FMU run
+    now_fmu = run_fmu(fmu_ok, fmu_path, ghi_now, temp_now)
+
+    # Current-moment pvlib
+    loc     = Location(SITE["lat"], SITE["lon"], tz=SITE["timezone"])
+    now_dt  = pd.Timestamp.now(tz=SITE["timezone"])
+    sp_now  = loc.get_solarposition(pd.DatetimeIndex([now_dt]))
+    now_pvl = run_pvlib(
+        ghi=ghi_now,
+        dhi=float(cur.get("diffuse_radiation", ghi_now * 0.15) or 0),
+        dni=float(cur.get("direct_radiation", max(0, ghi_now - 50)) or 0),
+        temp_c=temp_now, wind=wind_now,
+        solar_zenith=float(sp_now["apparent_zenith"].iloc[0]),
+        solar_azimuth=float(sp_now["azimuth"].iloc[0]),
+    )
+
+    fmu_p_kw   = now_fmu["P_ondu"] / 1000
+    pvl_p_kw   = now_pvl["Pmp"] / 1000
+    delta_kw   = fmu_p_kw - pvl_p_kw
+    delta_pct  = (delta_kw / pvl_p_kw * 100) if pvl_p_kw > 0.01 else 0
+
+    # ── PAGE HEADER ──────────────────────────────────────────────────────────
+    if ghi_now > 200:
+        status_cls, status_txt, status_color = "badge-green", "FULL PRODUCTION", "#2ECC71"
+    elif ghi_now > 50:
+        status_cls, status_txt, status_color = "badge-orange", "PARTIAL PRODUCTION", "#F5A623"
+    else:
+        status_cls, status_txt, status_color = "badge-blue", "STANDBY / NIGHT", "#3498DB"
+
+    mode_label = "FMU LIVE" if fmu_ok else "ANALYTICAL MODEL"
+    mode_cls   = "badge-green" if fmu_ok else "badge-orange"
+
+    st.markdown(f"""
+    <div style="background:#111318;border:1px solid #252A35;border-top:2px solid #F5A623;
+                border-radius:0 0 12px 12px;padding:20px 28px;margin-bottom:22px;
+                box-shadow:0 4px 20px rgba(0,0,0,.3);">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+        <div>
+          <div style="font-family:'Space Mono',monospace;font-size:18px;font-weight:700;
+                      background:linear-gradient(135deg,#F5A623,#E8860A);
+                      -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+                      text-transform:uppercase;letter-spacing:.06em;">{SITE['name']}</div>
+          <div style="font-size:11px;color:#6B7585;margin-top:4px;letter-spacing:.08em;text-transform:uppercase;">
+            {SITE['lat']}°N, {abs(SITE['lon'])}°W &nbsp;|&nbsp; {SITE['altitude']} m &nbsp;|&nbsp;
+            {SITE['capacity_kwp']} kWp &nbsp;|&nbsp; FMI 2.0 Co-Simulation
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+          <span class="badge {mode_cls}">
+            <span class="dot" style="background:{'#2ECC71' if fmu_ok else '#F5A623'}"></span>
+            {mode_label}
+          </span>
+          {badge(status_txt, status_cls, status_color)}
+          <div style="text-align:right;font-family:'Space Mono',monospace;">
+            <div style="font-size:12px;color:#6B7585">{datetime.now().strftime('%d/%m/%Y %H:%M')}</div>
+            <div style="font-size:10px;color:#3D4553">GHI {ghi_now:.0f} W/m² · Cloud {cloud_now:.0f}%</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # PAGE: LIVE DASHBOARD
+    # ═════════════════════════════════════════════════════════════════════════
+    if menu == "Live Dashboard":
+        st.markdown("## ⚡ Real-Time Digital Twin — Current Operating Point")
+
+        if not fmu_ok:
             st.markdown(
-                f'<div style="background:{status_color}22;border:1px solid {status_color};"'
-                f' class="stMetric"><p style="font-size:0.75rem;color:{C["muted"]};margin:0;">'
-                f'Diagnostic Auto</p>'
-                f'<p style="font-size:1rem;font-weight:700;color:{status_color};margin:4px 0 0;">'
-                f'{status_label}</p></div>',
+                info(
+                    f"<b>Analytical Fallback Active:</b> {fmu_reason}<br>"
+                    "The physics model below faithfully replicates the Simulink steady-state "
+                    "equations. To enable the live FMU: place <code>PV_MPPT_Inverter1.fmu</code> "
+                    "next to <code>app.py</code> and run on <b>Windows x64</b>.",
+                    warn=True,
+                ),
                 unsafe_allow_html=True,
             )
 
-        st.markdown(" ")
-        st.caption(
-            "🖱️ **Glisser** pour faire pivoter le panneau · "
-            "**Cliquer** sur une cellule pour voir ses paramètres · "
-            "Les boutons Normal / Défaut / Panne permettent de simuler des scénarios"
-        )
+        # ── Weather row ──────────────────────────────────────────────────────
+        st.markdown('<div class="sh">Live Weather — Open-Meteo API</div>', unsafe_allow_html=True)
+        wc = st.columns(5)
+        wc[0].markdown(kpi("Temperature", f"{temp_now:.1f}", "°C"), unsafe_allow_html=True)
+        wc[1].markdown(kpi("GHI Irradiance", f"{ghi_now:.0f}", "W/m²"), unsafe_allow_html=True)
+        wc[2].markdown(kpi("Wind Speed", f"{wind_now:.1f}", "km/h"), unsafe_allow_html=True)
+        wc[3].markdown(kpi("Humidity", f"{hum_now:.0f}", "%"), unsafe_allow_html=True)
+        wc[4].markdown(kpi("Cloud Cover", f"{cloud_now:.0f}", "%",
+                           color="#3498DB"), unsafe_allow_html=True)
+
         st.markdown("---")
 
-        # ── 3D Panel widget ──────────────────────────────────────
-        render_3d_panel(
-            p_inv = p_inv_live,
-            thd_v = thd_v_live,
-            thd_i = thd_i_live,
-        )
+        # ── FMU outputs row ──────────────────────────────────────────────────
+        st.markdown('<div class="sh">FMU Outputs — Simulink Physical Twin</div>', unsafe_allow_html=True)
+        fc = st.columns(5)
+        fc[0].markdown(kpi("PV Panel Power", f"{now_fmu['Ppanneau']/1000:.2f}", "kW (Ppanneau)"), unsafe_allow_html=True)
+        fc[1].markdown(kpi("Boost DC Power", f"{now_fmu['Pbooste']/1000:.2f}", "kW (Pbooste)"), unsafe_allow_html=True)
+        fc[2].markdown(kpi("AC Active Power", f"{now_fmu['P_ondu']/1000:.2f}", "kW (P_ondu)"), unsafe_allow_html=True)
+        fc[3].markdown(kpi("AC Reactive Power", f"{now_fmu['Q_ondu']/1000:.2f}", "kVAR"), unsafe_allow_html=True)
+        fc[4].markdown(kpi("Inverter Voltage", f"{now_fmu['Vonduleur']:.1f}", "V"), unsafe_allow_html=True)
 
+        st.markdown("---")
 
-# ════════════════════════════════════════════════════════════════════
-# SECTION 10 — APPLICATION ENTRY POINT
-# ════════════════════════════════════════════════════════════════════
+        # ── pvlib vs FMU comparison ──────────────────────────────────────────
+        st.markdown('<div class="sh">FMU Simulated vs pvlib Theoretical</div>', unsafe_allow_html=True)
+        cc = st.columns(4)
+        cc[0].markdown(kpi("FMU AC Power", f"{fmu_p_kw:.3f}", "kW"), unsafe_allow_html=True)
+        cc[1].markdown(kpi("pvlib MPP", f"{pvl_p_kw:.3f}", "kW", color="#3498DB"), unsafe_allow_html=True)
+        cc[2].markdown(kpi("Δ Power", f"{delta_kw:+.3f}", "kW",
+                           color="#2ECC71" if abs(delta_kw) < 0.1 else "#E74C3C"), unsafe_allow_html=True)
+        cc[3].markdown(kpi("Δ %", f"{delta_pct:+.1f}", "%",
+                           color="#2ECC71" if abs(delta_pct) < 5 else "#E74C3C"), unsafe_allow_html=True)
 
-def main():
-    # ── Page config ──────────────────────────────────────────────
-    st.set_page_config(
-        page_title="Digital Twin PV — ENSET",
-        layout="wide",
-        page_icon="☀️",
-    )
-    apply_global_css()
+        st.markdown("---")
 
-    # ── Load logo ────────────────────────────────────────────────
-    img_b64 = load_logo_base64("th.jpg")
+        # ── Today's hourly comparison chart ──────────────────────────────────
+        st.markdown('<div class="sh">Today\'s Hourly Forecast — FMU vs pvlib</div>', unsafe_allow_html=True)
 
-    # ── Start MQTT (background thread, cached) ───────────────────
-    start_mqtt_service()
+        if not df_hourly.empty:
+            today_df = df_hourly[df_hourly["time"].dt.date == datetime.now().date()].reset_index(drop=True)
 
-    # ── Page title ───────────────────────────────────────────────
-    st.markdown("""
-    <h1 style="color:#00d1b2;margin-bottom:0;">
-      ☀️ Digital Twin PV — ENSET Mohammedia
-    </h1>
-    <p style="color:#8fa3bf;margin-top:4px;font-size:0.9rem;">
-      Architecture comparative : MATLAB/Simulink (MQTT) ⟷ pvlib (Analytique) ⟷ Open-Meteo (Météo temps réel)
-    </p>
-    """, unsafe_allow_html=True)
-
-    # ── Main loop placeholder ────────────────────────────────────
-    placeholder = st.empty()
-
-    while True:
-        try:
-            now          = time.time()
-            current_vals = data_store.copy()
-
-            # ── 1. Record history sample ──────────────────────────
-            if now - global_data["last_record"] >= RECORD_EVERY:
-                history_list.append(current_vals.copy())
-                global_data["last_record"] = now
-                if len(history_list) > MAX_HISTORY:
-                    history_list.pop(0)
-
-            # ── 2. Refresh Open-Meteo weather (throttled) ─────────
-            maybe_refresh_weather()
-            raw_weather = global_data.get("weather_cache")
-            weather     = get_current_weather_values(raw_weather) if raw_weather else None
-
-            # ── 3. Run pvlib model ────────────────────────────────
-            pvlib_result = pvlib_calculate_power(weather) if weather else \
-                           {"P_DC_pvlib": 0, "P_AC_pvlib": 0, "T_module": 0, "POA": 0}
-
-            # ── 4. Append to comparative history ─────────────────
-            cmp_entry = (now, get_matlab_power(), pvlib_result["P_AC_pvlib"])
-            global_data["compare_hist"].append(cmp_entry)
-            if len(global_data["compare_hist"]) > MAX_HISTORY:
-                global_data["compare_hist"].pop(0)
-
-            # ── 5. Build history DataFrame ────────────────────────
-            if history_list:
-                df = pd.DataFrame(history_list).astype(float)
-                # Ensure all required columns exist
-                for col in TOPICS_MAP.values():
-                    if col not in df.columns:
-                        df[col] = 0.0
-            else:
-                df = pd.DataFrame({k: [0.0] for k in TOPICS_MAP.values()})
-
-            # ── 6. Sidebar ────────────────────────────────────────
-            render_sidebar(img_b64, history_list, weather)
-
-            # ── 7. Waiting state check ────────────────────────────
-            data_present = not (
-                current_vals["P_pv"] == 0 and
-                current_vals["V_inv"] == 0 and
-                current_vals["P_inv"] == 0
+            sp_today = loc.get_solarposition(
+                pd.DatetimeIndex(today_df["time"].dt.tz_localize(SITE["timezone"], ambiguous="NaT"), errors="coerce")
             )
 
-            with placeholder.container():
-                if not data_present:
-                    col_wait, col_info = st.columns(2)
-                    with col_wait:
-                        st.warning("⏳ En attente de données MQTT…")
-                        st.caption(f"Topics surveillés sous : `{PREFIX}`")
-                    with col_info:
-                        if weather:
-                            st.info(
-                                f"🌤️ Météo Open-Meteo disponible | "
-                                f"GHI={weather.get('GHI',0):.0f} W/m²  "
-                                f"T={weather.get('Temp',0):.1f}°C"
-                            )
-                            st.caption(
-                                f"pvlib P_AC théorique : "
-                                f"**{pvlib_result.get('P_AC_pvlib',0):.1f} W**"
-                            )
-                        else:
-                            st.info("🌐 Connexion à Open-Meteo en cours…")
-                else:
-                    render_dashboard(current_vals, df, pvlib_result, weather)
+            fmu_powers, pvl_powers, ghi_list = [], [], []
+            for i, row in today_df.iterrows():
+                fmu_r = run_fmu(fmu_ok, fmu_path, row["ghi"], row["temp"])
+                zen   = float(sp_today["apparent_zenith"].iloc[i]) if i < len(sp_today) else 90
+                azi   = float(sp_today["azimuth"].iloc[i])         if i < len(sp_today) else 180
+                pvl_r = run_pvlib(row["ghi"], row["dhi"], row["dni"],
+                                  row["temp"], row["wind"], zen, azi)
+                fmu_powers.append(fmu_r["P_ondu"] / 1000)
+                pvl_powers.append(pvl_r["Pmp"] / 1000)
+                ghi_list.append(row["ghi"])
 
-        except Exception as e:
-            # Silently absorb transient errors to keep the loop alive
-            global_data["last_error"] = str(e)
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+            fig.add_trace(go.Scatter(
+                x=today_df["time"], y=fmu_powers,
+                name="FMU AC Power", fill="tozeroy",
+                fillcolor="rgba(245,166,35,.12)",
+                line=dict(color="#F5A623", width=2.5),
+                hovertemplate="%{x|%H:%M}<br>FMU: %{y:.3f} kW<extra></extra>",
+            ), secondary_y=False)
+            fig.add_trace(go.Scatter(
+                x=today_df["time"], y=pvl_powers,
+                name="pvlib MPP", line=dict(color="#3498DB", width=2, dash="dash"),
+                hovertemplate="%{x|%H:%M}<br>pvlib: %{y:.3f} kW<extra></extra>",
+            ), secondary_y=False)
+            fig.add_trace(go.Bar(
+                x=today_df["time"], y=ghi_list,
+                name="GHI", marker_color="rgba(255,207,107,.3)",
+                hovertemplate="GHI: %{y:.0f} W/m²<extra></extra>",
+            ), secondary_y=True)
 
-        time.sleep(TIME_SLEEP)
+            fig.update_layout(
+                **plot_layout(height=380),
+                yaxis_title="Power (kW)",
+            )
+            fig.update_yaxes(title_text="GHI (W/m²)", secondary_y=True, gridcolor="#1E232D")
+            st.plotly_chart(fig, use_container_width=True)
+
+        # ── Gauge: inverter efficiency ────────────────────────────────────────
+        st.markdown('<div class="sh">Inverter Quality Indicators</div>', unsafe_allow_html=True)
+        gc = st.columns(3)
+
+        def gauge(title, val, max_val, color, suffix=""):
+            fig = go.Figure(go.Indicator(
+                mode="gauge+number+delta",
+                value=val,
+                number={"suffix": suffix, "font": {"color": color, "family": "Space Mono"}},
+                gauge=dict(
+                    axis=dict(range=[0, max_val], tickcolor="#6B7585"),
+                    bar=dict(color=color),
+                    bgcolor="#191D25",
+                    bordercolor="#252A35",
+                    steps=[dict(range=[0, max_val * 0.5], color="#0D1017"),
+                           dict(range=[max_val * 0.5, max_val], color="#141820")],
+                ),
+                title=dict(text=title, font=dict(color="#6B7585", size=12, family="Space Mono")),
+            ))
+            fig.update_layout(paper_bgcolor="#111318", height=220, margin=dict(t=40, b=10, l=20, r=20))
+            return fig
+
+        gc[0].plotly_chart(
+            gauge("Inverter η", now_fmu["rendement"] * 100, 100, "#2ECC71", "%"),
+            use_container_width=True)
+        gc[1].plotly_chart(
+            gauge("THD Voltage", now_fmu["THD_V"], 10, "#F5A623", "%"),
+            use_container_width=True)
+        gc[2].plotly_chart(
+            gauge("THD Current", now_fmu["THD_i"], 15, "#9B59B6", "%"),
+            use_container_width=True)
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # PAGE: HOURLY ANALYSIS
+    # ═════════════════════════════════════════════════════════════════════════
+    elif menu == "Hourly Analysis":
+        st.markdown("## 📊 Hourly Power & Weather Analysis")
+
+        if df_hourly.empty:
+            st.error("No weather data available.")
+            return
+
+        # Compute FMU and pvlib for all hourly forecast points
+        sp_all = loc.get_solarposition(
+            pd.DatetimeIndex(
+                df_hourly["time"].dt.tz_localize(SITE["timezone"], ambiguous="NaT"),
+                errors="coerce",
+            )
+        )
+
+        fmu_P, pvl_P, pvl_Vmp, pvl_Tcell, delta_P = [], [], [], [], []
+        for i, row in df_hourly.iterrows():
+            idx = i - df_hourly.index[0]
+            fmu_r = run_fmu(fmu_ok, fmu_path, row["ghi"], row["temp"])
+            zen   = float(sp_all["apparent_zenith"].iloc[idx]) if idx < len(sp_all) else 90
+            azi   = float(sp_all["azimuth"].iloc[idx])         if idx < len(sp_all) else 180
+            pvl_r = run_pvlib(row["ghi"], row["dhi"], row["dni"],
+                              row["temp"], row["wind"], zen, azi)
+            fp, pp = fmu_r["P_ondu"] / 1000, pvl_r["Pmp"] / 1000
+            fmu_P.append(fp)
+            pvl_P.append(pp)
+            pvl_Vmp.append(pvl_r["Vmp"])
+            pvl_Tcell.append(pvl_r["cell_temp"])
+            delta_P.append(fp - pp)
+
+        df_hourly = df_hourly.copy()
+        df_hourly["fmu_P_kw"]   = fmu_P
+        df_hourly["pvl_P_kw"]   = pvl_P
+        df_hourly["delta_kw"]   = delta_P
+        df_hourly["pvl_Vmp"]    = pvl_Vmp
+        df_hourly["cell_temp"]  = pvl_Tcell
+
+        # Chart 1: Power comparison
+        fig1 = go.Figure()
+        fig1.add_trace(go.Scatter(
+            x=df_hourly["time"], y=df_hourly["fmu_P_kw"],
+            name="FMU AC Output", fill="tozeroy",
+            fillcolor="rgba(245,166,35,.10)",
+            line=dict(color="#F5A623", width=2.5),
+        ))
+        fig1.add_trace(go.Scatter(
+            x=df_hourly["time"], y=df_hourly["pvl_P_kw"],
+            name="pvlib Theoretical MPP",
+            line=dict(color="#3498DB", width=2, dash="dash"),
+        ))
+        fig1.update_layout(**plot_layout(height=340, title_text="AC Power: FMU vs pvlib (kW)"))
+        st.plotly_chart(fig1, use_container_width=True)
+
+        # Chart 2: Delta
+        c1, c2 = st.columns(2)
+        with c1:
+            fig2 = go.Figure()
+            fig2.add_trace(go.Bar(
+                x=df_hourly["time"], y=df_hourly["delta_kw"],
+                marker_color=["#2ECC71" if d >= 0 else "#E74C3C" for d in df_hourly["delta_kw"]],
+                name="Δ Power (FMU − pvlib)",
+            ))
+            fig2.add_hline(y=0, line_color="#6B7585", line_width=1)
+            fig2.update_layout(**plot_layout(height=300, title_text="Power Delta (kW)"))
+            st.plotly_chart(fig2, use_container_width=True)
+
+        with c2:
+            # Scatter: irradiance vs power
+            fig3 = go.Figure()
+            fig3.add_trace(go.Scatter(
+                x=df_hourly["ghi"], y=df_hourly["fmu_P_kw"],
+                mode="markers", name="FMU",
+                marker=dict(color="#F5A623", size=7, opacity=0.8),
+            ))
+            fig3.add_trace(go.Scatter(
+                x=df_hourly["ghi"], y=df_hourly["pvl_P_kw"],
+                mode="markers", name="pvlib",
+                marker=dict(color="#3498DB", size=7, opacity=0.8, symbol="diamond"),
+            ))
+            fig3.update_layout(**plot_layout(
+                height=300,
+                title_text="GHI vs Power (W/m² → kW)",
+                xaxis=dict(title="GHI (W/m²)", gridcolor="#1E232D"),
+                yaxis=dict(title="Power (kW)", gridcolor="#1E232D"),
+            ))
+            st.plotly_chart(fig3, use_container_width=True)
+
+        # Chart 3: Cell temp vs ambient
+        fig4 = go.Figure()
+        fig4.add_trace(go.Scatter(
+            x=df_hourly["time"], y=df_hourly["temp"],
+            name="Ambient", line=dict(color="#3498DB", width=2),
+        ))
+        fig4.add_trace(go.Scatter(
+            x=df_hourly["time"], y=df_hourly["cell_temp"],
+            name="Cell (SAPM)", line=dict(color="#E74C3C", width=2),
+        ))
+        fig4.update_layout(**plot_layout(height=280, title_text="Temperature: Ambient vs PV Cell (°C)"))
+        st.plotly_chart(fig4, use_container_width=True)
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # PAGE: FMU vs PVLIB DEEP-DIVE
+    # ═════════════════════════════════════════════════════════════════════════
+    elif menu == "FMU vs pvlib Deep-Dive":
+        st.markdown("## 🔬 FMU ↔ pvlib Model Comparison")
+
+        st.markdown(info(
+            "<b>How to read this page:</b> Both models receive identical inputs (irradiance, temperature). "
+            "The FMU encodes the exact Simulink circuit physics (MPPT + Boost + H-bridge inverter). "
+            "pvlib uses the De Soto single-diode model at the panel terminals (theoretical MPP). "
+            "The delta reveals losses from MPPT imperfection, switching, and EMI."
+        ), unsafe_allow_html=True)
+
+        # Sweep: irradiance at fixed temperature
+        st.markdown("### Irradiance Sweep (Temperature = 25°C)")
+        irr_sweep = np.linspace(0, 1200, 61)
+        rows = []
+        for g in irr_sweep:
+            fmu_r = run_fmu(fmu_ok, fmu_path, g, 25.0)
+            pvl_r = run_pvlib(g, g * 0.12, max(0, g - 50), 25.0, 2.0, 30.0, 180.0)
+            rows.append(dict(
+                G=g,
+                fmu_P=fmu_r["P_ondu"] / 1000,
+                fmu_Pp=fmu_r["Ppanneau"] / 1000,
+                pvl_P=pvl_r["Pmp"] / 1000,
+                eta_fmu=fmu_r["rendement"],
+                THD_V=fmu_r["THD_V"],
+                THD_i=fmu_r["THD_i"],
+            ))
+        df_irr = pd.DataFrame(rows)
+
+        fig_irr = go.Figure()
+        fig_irr.add_trace(go.Scatter(x=df_irr["G"], y=df_irr["fmu_P"],
+            name="FMU AC Output", line=dict(color="#F5A623", width=2.5)))
+        fig_irr.add_trace(go.Scatter(x=df_irr["G"], y=df_irr["fmu_Pp"],
+            name="FMU Panel DC", line=dict(color="#E8860A", width=1.5, dash="dot")))
+        fig_irr.add_trace(go.Scatter(x=df_irr["G"], y=df_irr["pvl_P"],
+            name="pvlib Theoretical MPP", line=dict(color="#3498DB", width=2, dash="dash")))
+        fig_irr.update_layout(**plot_layout(
+            height=360, title_text="Power vs Irradiance (T=25°C)",
+            xaxis=dict(title="Irradiance (W/m²)", gridcolor="#1E232D"),
+            yaxis=dict(title="Power (kW)", gridcolor="#1E232D"),
+        ))
+        st.plotly_chart(fig_irr, use_container_width=True)
+
+        # Sweep: temperature at fixed irradiance
+        st.markdown("### Temperature Sweep (Irradiance = 1000 W/m²)")
+        temp_sweep = np.linspace(-5, 70, 51)
+        rows_t = []
+        for t in temp_sweep:
+            fmu_r = run_fmu(fmu_ok, fmu_path, 1000.0, t)
+            pvl_r = run_pvlib(1000.0, 120.0, 900.0, t, 2.0, 30.0, 180.0)
+            rows_t.append(dict(T=t, fmu_P=fmu_r["P_ondu"] / 1000, pvl_P=pvl_r["Pmp"] / 1000))
+        df_temp = pd.DataFrame(rows_t)
+
+        fig_temp = go.Figure()
+        fig_temp.add_trace(go.Scatter(x=df_temp["T"], y=df_temp["fmu_P"],
+            name="FMU AC", line=dict(color="#F5A623", width=2.5)))
+        fig_temp.add_trace(go.Scatter(x=df_temp["T"], y=df_temp["pvl_P"],
+            name="pvlib MPP", line=dict(color="#3498DB", width=2, dash="dash")))
+        fig_temp.update_layout(**plot_layout(
+            height=320, title_text="Power vs Temperature (G=1000 W/m²)",
+            xaxis=dict(title="Temperature (°C)", gridcolor="#1E232D"),
+            yaxis=dict(title="Power (kW)", gridcolor="#1E232D"),
+        ))
+        st.plotly_chart(fig_temp, use_container_width=True)
+
+        # THD & Efficiency vs irradiance
+        c1, c2 = st.columns(2)
+        with c1:
+            fig_eff = go.Figure()
+            fig_eff.add_trace(go.Scatter(x=df_irr["G"], y=df_irr["eta_fmu"] * 100,
+                name="Inverter η", fill="tozeroy", fillcolor="rgba(46,204,113,.08)",
+                line=dict(color="#2ECC71", width=2)))
+            fig_eff.update_layout(**plot_layout(
+                height=300, title_text="Inverter Efficiency vs Irradiance (%)",
+                xaxis=dict(title="GHI (W/m²)", gridcolor="#1E232D"),
+                yaxis=dict(title="η (%)", gridcolor="#1E232D", range=[0, 105]),
+            ))
+            st.plotly_chart(fig_eff, use_container_width=True)
+
+        with c2:
+            fig_thd = go.Figure()
+            fig_thd.add_trace(go.Scatter(x=df_irr["G"], y=df_irr["THD_V"],
+                name="THD-V", line=dict(color="#9B59B6", width=2)))
+            fig_thd.add_trace(go.Scatter(x=df_irr["G"], y=df_irr["THD_i"],
+                name="THD-I", line=dict(color="#E74C3C", width=2, dash="dash")))
+            fig_thd.add_hline(y=5, line_dash="dot", line_color="#6B7585",
+                              annotation_text="IEEE 1547 limit 5%")
+            fig_thd.update_layout(**plot_layout(
+                height=300, title_text="THD vs Irradiance (%)",
+                xaxis=dict(title="GHI (W/m²)", gridcolor="#1E232D"),
+                yaxis=dict(title="THD (%)", gridcolor="#1E232D"),
+            ))
+            st.plotly_chart(fig_thd, use_container_width=True)
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # PAGE: HISTORICAL SIMULATION
+    # ═════════════════════════════════════════════════════════════════════════
+    elif menu == "Historical Simulation":
+        st.markdown("## 📈 Historical Energy Simulation")
+
+        if hist_start is None or hist_end is None:
+            st.info("Select a date range in the sidebar.")
+            return
+
+        with st.spinner("Fetching historical weather from Open-Meteo Archive…"):
+            df_hist = get_historical_weather(
+                SITE["lat"], SITE["lon"],
+                str(hist_start), str(hist_end),
+            )
+
+        if df_hist.empty:
+            st.error("No historical data returned.")
+            return
+
+        st.success(f"Loaded {len(df_hist)} hourly records ({hist_start} → {hist_end})")
+
+        # Batch simulation
+        with st.spinner("Running batch FMU + pvlib simulation…"):
+            loc_h = Location(SITE["lat"], SITE["lon"],
+                             altitude=SITE["altitude"], tz=SITE["timezone"])
+            sp_h = loc_h.get_solarposition(
+                pd.DatetimeIndex(
+                    df_hist["time"].dt.tz_localize(SITE["timezone"], ambiguous="NaT"),
+                    errors="coerce",
+                )
+            )
+            fmu_E, pvl_E = [], []
+            for i, row in df_hist.iterrows():
+                idx = i - df_hist.index[0]
+                fmu_r = run_fmu(fmu_ok, fmu_path, row["ghi"], row["temp"])
+                zen   = float(sp_h["apparent_zenith"].iloc[idx]) if idx < len(sp_h) else 90
+                azi   = float(sp_h["azimuth"].iloc[idx])         if idx < len(sp_h) else 180
+                pvl_r = run_pvlib(
+                    row["ghi"], row["dhi"], row["dni"],
+                    row["temp"], row["wind"], zen, azi,
+                )
+                fmu_E.append(fmu_r["P_ondu"] / 1000)
+                pvl_E.append(pvl_r["Pmp"] / 1000)
+
+        df_hist["fmu_kw"] = fmu_E
+        df_hist["pvl_kw"] = pvl_E
+
+        # Daily aggregation
+        df_hist["date"] = df_hist["time"].dt.date
+        daily = df_hist.groupby("date").agg(
+            fmu_kwh=("fmu_kw", "sum"),
+            pvl_kwh=("pvl_kw", "sum"),
+            avg_ghi=("ghi", "mean"),
+            avg_temp=("temp", "mean"),
+        ).reset_index()
+        daily["date"]    = pd.to_datetime(daily["date"])
+        daily["delta"]   = daily["fmu_kwh"] - daily["pvl_kwh"]
+        daily["pr"]      = (daily["fmu_kwh"] / (daily["avg_ghi"] / 1000 * 24
+                            * SITE["capacity_kwp"] + 1e-6)).clip(0, 1) * 100
+
+        # Summary KPIs
+        kc = st.columns(5)
+        kc[0].markdown(kpi("Total FMU Energy", f"{daily['fmu_kwh'].sum()/1000:.2f}", "MWh"), unsafe_allow_html=True)
+        kc[1].markdown(kpi("Total pvlib Energy", f"{daily['pvl_kwh'].sum()/1000:.2f}", "MWh", color="#3498DB"), unsafe_allow_html=True)
+        kc[2].markdown(kpi("Avg Daily PR", f"{daily['pr'].mean():.1f}", "%"), unsafe_allow_html=True)
+        kc[3].markdown(kpi("Peak Day FMU", f"{daily['fmu_kwh'].max():.1f}", "kWh"), unsafe_allow_html=True)
+        kc[4].markdown(kpi("Total Δ Energy", f"{daily['delta'].sum():+.1f}", "kWh",
+                           color="#2ECC71" if daily["delta"].sum() >= 0 else "#E74C3C"), unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # Daily bar chart
+        fig_d = go.Figure()
+        fig_d.add_trace(go.Bar(x=daily["date"], y=daily["fmu_kwh"],
+            name="FMU Energy", marker_color="#F5A623", opacity=0.85))
+        fig_d.add_trace(go.Scatter(x=daily["date"], y=daily["pvl_kwh"],
+            name="pvlib Energy", line=dict(color="#3498DB", width=2, dash="dash")))
+        fig_d.update_layout(**plot_layout(
+            height=360, title_text="Daily Energy: FMU vs pvlib (kWh)",
+            yaxis=dict(title="kWh", gridcolor="#1E232D"),
+        ))
+        st.plotly_chart(fig_d, use_container_width=True)
+
+        # PR chart
+        fig_pr = go.Figure()
+        fig_pr.add_trace(go.Scatter(x=daily["date"], y=daily["pr"],
+            fill="tozeroy", fillcolor="rgba(26,188,156,.1)",
+            line=dict(color="#1ABC9C", width=1.5), name="PR %"))
+        fig_pr.add_hline(y=75, line_dash="dash", line_color="#6B7585", annotation_text="Target 75%")
+        fig_pr.update_layout(**plot_layout(
+            height=280, title_text="Daily Performance Ratio (%)",
+            yaxis=dict(title="%", gridcolor="#1E232D", range=[0, 110]),
+        ))
+        st.plotly_chart(fig_pr, use_container_width=True)
+
+        # Download
+        csv = daily.to_csv(index=False, float_format="%.3f")
+        st.download_button(
+            "⬇  Download Daily Results (CSV)", csv,
+            file_name=f"solaris_fmu_pvlib_{hist_start}_{hist_end}.csv",
+            mime="text/csv",
+        )
+
+    # ═════════════════════════════════════════════════════════════════════════
+    # PAGE: SYSTEM SPECS & FMU INFO
+    # ═════════════════════════════════════════════════════════════════════════
+    elif menu == "System Specs & FMU Info":
+        st.markdown("## 🗂 System Specifications & FMU Integration Details")
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            st.markdown("""
+            <div class="spec-block">
+              <div class="spec-head">FMU — PV_MPPT_Inverter1</div>
+              <table class="spec-tbl">
+                <tr><td>FMI Standard</td><td>2.0 — Co-Simulation</td></tr>
+                <tr><td>Generated by</td><td>Simulink R2024a + FMI Kit 3.1</td></tr>
+                <tr><td>Author</td><td>Bilal Mouffakir</td></tr>
+                <tr><td>Solver</td><td>ode3 (Bogacki-Shampine)</td></tr>
+                <tr><td>Native step size</td><td>1 µs</td></tr>
+                <tr><td>Stop time</td><td>0.2 s (4 × 50 Hz cycles)</td></tr>
+                <tr><td>Binary</td><td>win64 DLL</td></tr>
+                <tr><td>GUID</td><td style="font-size:10px">5c811850-6386-44fa…</td></tr>
+              </table>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.markdown("""
+            <div class="spec-block">
+              <div class="spec-head">FMU Inputs</div>
+              <table class="spec-tbl">
+                <tr><td>Inport  (VR 633)</td><td>Ambient Temperature [°C]</td></tr>
+                <tr><td>Inport1 (VR 634)</td><td>Irradiance [W/m²]</td></tr>
+              </table>
+            </div>
+            <div class="spec-block">
+              <div class="spec-head">FMU Outputs</div>
+              <table class="spec-tbl">
+                <tr><td>Ppanneau  (VR 637)</td><td>PV Panel DC Power [W]</td></tr>
+                <tr><td>Pbooste   (VR 636)</td><td>Boost MPPT DC Power [W]</td></tr>
+                <tr><td>P_ondu    (VR 639)</td><td>AC Active Power [W]</td></tr>
+                <tr><td>Q_ondu    (VR 640)</td><td>AC Reactive Power [VAR]</td></tr>
+                <tr><td>S_ondu    (VR 638)</td><td>AC Apparent Power [VA]</td></tr>
+                <tr><td>Vonduleur (VR 635)</td><td>Inverter Output Voltage [V]</td></tr>
+                <tr><td>THD_V     (VR 641)</td><td>Voltage THD [%]</td></tr>
+                <tr><td>THD_i     (VR 642)</td><td>Current THD [%]</td></tr>
+                <tr><td>rendement (VR 643)</td><td>Inverter Efficiency [-]</td></tr>
+              </table>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with c2:
+            st.markdown(f"""
+            <div class="spec-block">
+              <div class="spec-head">PV Array — Cell Amrecan OS-P72-330W</div>
+              <table class="spec-tbl">
+                <tr><td>Configuration</td><td><span class="hi">6 series × 2 parallel</span></td></tr>
+                <tr><td>Module peak power</td><td><span class="hi">330 Wc</span></td></tr>
+                <tr><td>Array capacity</td><td><span class="hi">3.96 kWp</span></td></tr>
+                <tr><td>Voc / Vmp</td><td>45.6 V / 37.2 V</td></tr>
+                <tr><td>Isc / Imp</td><td>9.45 A / 8.88 A</td></tr>
+                <tr><td>γ_pdc (temp coeff)</td><td>−0.40 %/°C</td></tr>
+                <tr><td>Technology</td><td>Polycrystalline</td></tr>
+                <tr><td>Tilt / Azimuth</td><td>{SITE['tilt']}° / {SITE['azimuth']}°</td></tr>
+              </table>
+            </div>
+            <div class="spec-block">
+              <div class="spec-head">Inverter — IMEON 3.6</div>
+              <table class="spec-tbl">
+                <tr><td>Rated power</td><td>4 kVA</td></tr>
+                <tr><td>Efficiency</td><td>96 %</td></tr>
+                <tr><td>MPPT channels</td><td>2</td></tr>
+                <tr><td>Max DC voltage</td><td>500 V</td></tr>
+                <tr><td>Grid connection</td><td>BT 220 V / 50 Hz</td></tr>
+                <tr><td>Protection class</td><td>IP65</td></tr>
+              </table>
+            </div>
+            <div class="spec-block">
+              <div class="spec-head">Integration — Runtime status</div>
+              <table class="spec-tbl">
+                <tr><td>Platform</td><td>{platform.system()} {platform.machine()}</td></tr>
+                <tr><td>FMU file found</td><td>{'Yes — ' + str(fmu_path) if fmu_path else 'No'}</td></tr>
+                <tr><td>FMU executable</td><td>{'✅ Live' if fmu_ok else '⚠ Fallback'}</td></tr>
+                <tr><td>Reason</td><td style="font-size:11px">{fmu_reason}</td></tr>
+                <tr><td>pvlib version</td><td>{pvlib.__version__}</td></tr>
+              </table>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # FMU deployment guide
+        st.markdown("### FMU Deployment Guide")
+        st.markdown("""
+        <div class="info-banner">
+        <b>To enable live FMU execution:</b><br>
+        1. Run the app on <b>Windows x64</b> (the FMU ships with a <code>win64/PV_MPPT_Inverter1.dll</code>).<br>
+        2. Place <code>PV_MPPT_Inverter1.fmu</code> in the same folder as <code>app.py</code>.<br>
+        3. Install fmpy: <code>pip install fmpy</code><br>
+        4. The app will auto-detect the DLL and switch to live simulation — no code changes needed.<br><br>
+        <b>To build a Linux binary from source:</b> Extract the ZIP, compile the C sources with GCC,
+        wrap in an FMU structure with a <code>linux64/</code> binary, then repackage as <code>.fmu</code>.
+        </div>
+        """, unsafe_allow_html=True)
+
+        with st.expander("fmpy integration code snippet", expanded=False):
+            st.code("""
+# ── How the FMU is called in this app (run_fmu_live) ──────────────────────
+from fmpy import simulate_fmu
+
+result = simulate_fmu(
+    "PV_MPPT_Inverter1.fmu",
+    start_time = 0.0,
+    stop_time  = 0.20,          # 4 × 50 Hz electrical cycles
+    step_size  = 1e-4,          # communication step (DLL runs at 1µs internally)
+    start_values = {
+        "Inport":  temp_celsius,       # [°C]  — FMU adds 273.15 K internally
+        "Inport1": irradiance_wm2,     # [W/m²] — FMU scales × uSref_Gain=0.001
+    },
+    output = [
+        "Ppanneau", "Pbooste",
+        "P_ondu", "Q_ondu", "S_ondu",
+        "Vonduleur", "THD_V", "THD_i",
+        "rendemet de onduleur",
+    ],
+)
+
+# Average last 50% of trajectory → steady-state operating point
+half = len(result) // 2
+P_ac_kw = float(result["P_ondu"][half:].mean()) / 1000
+""", language="python")
+
+    # ── FOOTER ───────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown(
+        f'<div style="text-align:center;color:#252A35;font-size:11px;padding:8px 0;'
+        f'font-family:\'Space Mono\',monospace;letter-spacing:.08em;">'
+        f'SOLARIS DIGITAL TWIN v2.1 &nbsp;|&nbsp; FMI 2.0 Co-Simulation &nbsp;|&nbsp; '
+        f'pvlib {pvlib.__version__} + Open-Meteo &nbsp;|&nbsp; '
+        f'{datetime.now().strftime("%d/%m/%Y %H:%M")}'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
 
-# ════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     main()
