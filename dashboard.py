@@ -43,7 +43,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # FMU file — must live in the same directory as app.py (relative path for cloud)
-FMU_PATH = os.path.join(os.path.dirname(__file__), "model.fmu")
+FMU_PATH = os.path.join(os.path.dirname(__file__), "PV_MPPT_Inverter1.fmu")
 
 # Open-Meteo API — Mohammedia, Morocco
 LAT, LON = 33.68, -7.38
