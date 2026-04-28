@@ -19,3 +19,4 @@ fmpy>=0.3.21             # FMI 2.0/3.0 co-simulation; requires libgfortran5 (pac
 
 # ── Visualisation ─────────────────────────────────────────────────────────────
 plotly>=5.20.0
+libgfortran5
