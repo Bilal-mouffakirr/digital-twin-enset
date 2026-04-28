@@ -1,26 +1,6 @@
-# ════════════════════════════════════════════════════════════════
-# requirements.txt — Digital Twin PV · ENSET Mohammedia
-# Install: pip install -r requirements.txt
-# ════════════════════════════════════════════════════════════════
-
-# ── Web dashboard ────────────────────────────────────────────────
-streamlit>=1.32.0
-
-# ── MQTT broker client ───────────────────────────────────────────
-paho-mqtt>=2.0.0
-
-# ── Data & numerics ──────────────────────────────────────────────
-pandas>=2.0.0
-numpy>=1.24.0
-
-# ── HTTP / Open-Meteo API ────────────────────────────────────────
-requests>=2.31.0
-
-# ── Charts ───────────────────────────────────────────────────────
-plotly>=5.18.0
-
-# ── PV analytical model ──────────────────────────────────────────
-pvlib>=0.10.3
-
-# ── pvlib optional dependencies (solar position + atmosphere) ────
-scipy>=1.11.0
+streamlit
+pvlib
+plotly
+pandas
+numpy
+requests
