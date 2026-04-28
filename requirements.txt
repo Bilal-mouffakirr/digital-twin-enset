@@ -1,10 +1,21 @@
-# ─────────────────────────────────────────────────────────────────
-#  requirements.txt — Solar Digital Twin
-#  Compatible with Streamlit Community Cloud (Python 3.11, Linux)
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# requirements.txt — Solar PV Digital Twin Dashboard
+# Streamlit Community Cloud (Linux / Python 3.11)
+# ─────────────────────────────────────────────────────────────────────────────
 
+# ── Core UI ──────────────────────────────────────────────────────────────────
 streamlit>=1.35.0
-fmpy>=0.3.21
+
+# ── HTTP / Data ───────────────────────────────────────────────────────────────
 requests>=2.31.0
-pandas>=2.1.0
+pandas>=2.0.0
 numpy>=1.26.0
+
+# ── Solar modelling ───────────────────────────────────────────────────────────
+pvlib>=0.10.4            # PVWatts DC/AC model + irradiance transposition
+
+# ── FMU Co-Simulation ─────────────────────────────────────────────────────────
+fmpy>=0.3.21             # FMI 2.0/3.0 co-simulation; requires libgfortran5 (packages.txt)
+
+# ── Visualisation ─────────────────────────────────────────────────────────────
+plotly>=5.20.0
