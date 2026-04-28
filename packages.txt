@@ -1,17 +1,13 @@
-# ─────────────────────────────────────────────────────────────────
-#  packages.txt — System-level APT packages
-#  Required by Streamlit Community Cloud (Ubuntu) for fmpy / FMU
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# packages.txt — System-level apt packages for Streamlit Community Cloud
+#
+# These are installed via `apt-get` before Python packages.
+# Required because the Simulink-generated FMU shared library (.so) is linked
+# against the GNU Fortran runtime.
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Fortran runtime — needed by FMU shared libraries compiled with gfortran
+# GNU Fortran runtime (needed by fmpy to load Simulink-generated FMU binaries)
 libgfortran5
 
-# GCC C++ standard library — needed by Simulink-generated FMU binaries
-libstdc++6
-
-# Unzip utility — fmpy uses it to extract the FMU archive
+# Unzip utility — fmpy extracts the .fmu archive at runtime
 unzip
-
-# OpenBLAS / LAPACK — numerical backends used by some FMU state-space solvers
-libopenblas0
-liblapack3
