@@ -1,6 +1,7 @@
 streamlit
+fmpy
 pvlib
 plotly
-pandas
-numpy
 requests
+numpy
+pandas
