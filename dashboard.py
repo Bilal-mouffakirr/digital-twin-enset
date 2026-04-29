@@ -627,13 +627,30 @@ if weather_ok:
             }).dropna()
             merged = merged[merged["FMU [kW]"] > 0.01]
 
-            fig_scatter = px.scatter(merged, x="PVLib [kW]", y="FMU [kW]",
-                                     trendline="ols",
-                                     color_discrete_sequence=["#f59e0b"],
-                                     template="plotly_dark",
-                                     labels={"PVLib [kW]": "PVLib [kW]", "FMU [kW]": "FMU [kW]"})
-            fig_scatter.update_layout(height=350, paper_bgcolor="#0f172a", plot_bgcolor="#1e293b",
-                                      margin=dict(l=60, r=20, t=30, b=40))
+            # Manual OLS trendline (no statsmodels needed)
+            x_vals = merged["PVLib [kW]"].values
+            y_vals = merged["FMU [kW]"].values
+            m, b = np.polyfit(x_vals, y_vals, 1)
+            x_line = np.linspace(x_vals.min(), x_vals.max(), 100)
+            y_line = m * x_line + b
+
+            fig_scatter = go.Figure()
+            fig_scatter.add_trace(go.Scatter(
+                x=x_vals, y=y_vals, mode="markers",
+                marker=dict(color="#f59e0b", size=5, opacity=0.7),
+                name="Points"))
+            fig_scatter.add_trace(go.Scatter(
+                x=x_line, y=y_line, mode="lines",
+                line=dict(color="#ef4444", width=2, dash="dash"),
+                name=f"Régression (y={m:.2f}x+{b:.3f})"))
+            fig_scatter.update_layout(
+                height=350, template="plotly_dark",
+                paper_bgcolor="#0f172a", plot_bgcolor="#1e293b",
+                xaxis_title="PVLib [kW]", yaxis_title="FMU [kW]",
+                legend=dict(bgcolor="#1e293b"),
+                margin=dict(l=60, r=20, t=30, b=40))
+            fig_scatter.update_xaxes(gridcolor="#334155")
+            fig_scatter.update_yaxes(gridcolor="#334155")
             st.plotly_chart(fig_scatter, use_container_width=True)
 
             # Stats
