@@ -154,7 +154,5 @@ L'application utilise l'API **Open-Meteo** (gratuite, sans clé API) :
 - **Données météo:** [Open-Meteo](https://open-meteo.com)
 - **PVLib:** [pvlib-python.readthedocs.io](https://pvlib-python.readthedocs.io)
 
-## 👥 Équipe
 
-HAMI Hassan · LAASRI Ayoub · BAGHAR Brahim · BERGDI Oussama · AZMAMI Halima · MGADA Mohammed Elhassan  
-Encadrants: M. EL BAHATI & M. EL MAGRI
+
