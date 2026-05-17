@@ -9,6 +9,7 @@ import numpy as np
 import requests
 import plotly.graph_objects as go
 import plotly.express as px
+from plotly.subplots import make_subplots  # ✅ Déplacé ici
 from datetime import datetime, timedelta
 import pvlib
 from pvlib.location import Location
@@ -317,7 +318,7 @@ def compute_daily(results):
         avg_humidity=("humidity","mean"),avg_cloud=("cloud_cover","mean"),
         peak_sun_hours=("poa_isotropic",lambda x:x.sum()/1000),
         theoretical_psh=("ghi",lambda x:x.sum()/1000)).reset_index()
-    daily["theoretical_kwh"]=daily["peak_sun_hours"]*cap
+    daily["theoretical_kwh"] = (daily["peak_sun_hours"] * cap).clip(lower=0)  # ✅ clip positif
     daily["pr"]=(daily["production_kwh"]/daily["theoretical_kwh"].replace(0,np.nan)).clip(0,1)*100
     daily["capacity_factor"]=(daily["production_kwh"]/(24*cap))*100
     daily["energy_yield"]=daily["production_kwh"]/cap
@@ -350,7 +351,13 @@ def blynk_get_pin(pin):
     url=f"{BLYNK_CONFIG['server']}get?token={BLYNK_CONFIG['auth_token']}&{pin}"
     try:
         r=requests.get(url,timeout=5)
-        if r.status_code==200: return r.json()
+        if r.status_code==200:
+            data = r.json()
+            # ✅ Gestion correcte du retour JSON
+            if isinstance(data, list) and len(data) > 0:
+                return int(data[0])
+            elif isinstance(data, (int, str)):
+                return int(data)
     except: return None
 
 def blynk_set_pin(pin,value):
@@ -372,7 +379,7 @@ def calculate_financial_metrics(kwh,price=0.12): return kwh*price
 # ════════════════════════════════════════════════════════
 # FMU SIMULATION FUNCTIONS
 # ════════════════════════════════════════════════════════
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60)  # ✅ TTL réduit, ne cache pas les None
 def fetch_meteo_now():
     now=datetime.now()
     s=(now-timedelta(hours=2)).strftime("%Y-%m-%d")
@@ -382,15 +389,17 @@ def fetch_meteo_now():
          f"&hourly=shortwave_radiation,diffuse_radiation,"
          f"direct_normal_irradiance,temperature_2m,windspeed_10m"
          f"&start_date={s}&end_date={e}&timezone=Africa%2FCasablanca")
-    r=requests.get(url,timeout=8); r.raise_for_status()
-    d=r.json()["hourly"]
-    df=pd.DataFrame(d); df.columns=["time","GHI","DHI","DNI","Tamb","wind"]
-    df["time"]=pd.to_datetime(df["time"])
-    df=df[df["time"]<=pd.Timestamp.now()].dropna()
-    if df.empty: return None
-    row=df.iloc[-1]
-    return {k:max(float(row[k]),0) if k!="Tamb" else float(row[k])
-            for k in ["GHI","DHI","DNI","Tamb","wind"]} | {"ts":row.time}
+    try:
+        r=requests.get(url,timeout=8); r.raise_for_status()
+        d=r.json()["hourly"]
+        df=pd.DataFrame(d); df.columns=["time","GHI","DHI","DNI","Tamb","wind"]
+        df["time"]=pd.to_datetime(df["time"])
+        df=df[df["time"]<=pd.Timestamp.now()].dropna()
+        if df.empty: return None
+        row=df.iloc[-1]
+        return {k:max(float(row[k]),0) if k!="Tamb" else float(row[k])
+                for k in ["GHI","DHI","DNI","Tamb","wind"]} | {"ts":row.time}
+    except: return None
 
 def fmu_step(G,Tamb,wind):
     G=max(G,0.)
@@ -407,11 +416,23 @@ def fmu_step(G,Tamb,wind):
     elif rat<0.70: ei=0.970
     else:          ei=0.970-0.003*((rat-0.70)/0.30)
     Pac=Pb*ei; cp=0.99
+    
+    # ✅ Filtrer THD à charge nulle
+    if Ppv > 10:
+        thdv = 1.8+0.5*(1-rat)
+        thdi = 3.0+2.0*(1-rat)
+    else:
+        thdv = 0.0
+        thdi = 0.0
+    
     return dict(Tc=Tc,Vmpp=Vmpp,Impp=Impp,Ppv=Ppv,Pboost=Pb,
                 Pac=Pac,Vac=220.,S=Pac/cp,Q=(Pac/cp)*np.sqrt(max(1-cp**2,0)),
-                eta=ei*100,THDv=1.8+0.5*(1-rat),THDi=3.0+2.0*(1-rat))
+                eta=ei*100,THDv=thdv,THDi=thdi)
 
 def pvlib_step_rt(GHI,DHI,DNI,Tamb,wind,ts):
+    # ✅ Garde pour timestamp invalide
+    if pd.isna(ts):
+        return 0.
     try:
         loc=Location(SITE["lat"],SITE["lon"],tz=SITE["timezone"],altitude=SITE["altitude"])
         t=pd.DatetimeIndex([ts],tz=SITE["timezone"])
@@ -454,12 +475,25 @@ with st.sidebar:
         "⚡ FMU Temps Réel","Controle Relais","Rapport"],
         label_visibility="collapsed")
     st.markdown("---")
-    st.markdown("**Periode d'analyse**")
-    col_s,col_e=st.columns(2)
+    
+    # ✅ Gestion correcte des presets
+    st.markdown("**Période d'analyse**")
+    
+    # Lire les valeurs du session state AVANT les widgets
+    preset_start = st.session_state.pop("_ps", None)
+    preset_end = st.session_state.pop("_pe", None)
+    
+    default_start = preset_start if preset_start else datetime(2026, 4, 1).date()
+    default_end = preset_end if preset_end else datetime.today().date()
+    
+    col_s, col_e = st.columns(2)
     with col_s:
-        start_date=st.date_input("Debut",value=datetime(2026,4,1).date(),label_visibility="collapsed")
+        st.caption("Début")
+        start_date = st.date_input("start", value=default_start, label_visibility="collapsed")
     with col_e:
-        end_date=st.date_input("Fin",value=datetime.today().date(),label_visibility="collapsed")
+        st.caption("Fin")
+        end_date = st.date_input("end", value=default_end, label_visibility="collapsed")
+    
     preset_cols=st.columns(3)
     with preset_cols[0]:
         if st.button("7j",key="7d"):
@@ -473,12 +507,13 @@ with st.sidebar:
         if st.button("90j",key="90d"):
             st.session_state["_ps"]=(datetime.now()-timedelta(days=90)).date()
             st.session_state["_pe"]=datetime.now().date(); st.rerun()
-    if "_ps" in st.session_state: start_date=st.session_state.pop("_ps")
-    if "_pe" in st.session_state: end_date=st.session_state.pop("_pe")
+    
     st.markdown(f"Du **{start_date.strftime('%d/%m/%Y')}** au **{end_date.strftime('%d/%m/%Y')}**")
-    data_age=(datetime.now().date()-end_date).days
-    if data_age==0: st.markdown('<div class="data-info">Donnees actualisees aujourd\'hui</div>',unsafe_allow_html=True)
-    else: st.markdown(f'<div class="data-info">Actualisees il y a {data_age} jours</div>',unsafe_allow_html=True)
+    data_age = max((datetime.now().date() - end_date).days, 0)  # ✅ pas de valeurs négatives
+    if data_age==0:
+        st.markdown('<div class="data-info">Donnees actualisees aujourd\'hui</div>',unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div class="data-info">Actualisees il y a {data_age} jours</div>',unsafe_allow_html=True)
     st.markdown("---")
     st.markdown("**Systeme**")
     st.markdown(f"Capacite : **{SITE['capacity_kwp']} kWp**")
@@ -611,7 +646,11 @@ if menu == "⚡ FMU Temps Réel":
             G,DHI,DNI=wx["GHI"],wx["DHI"],wx["DNI"]
             Tamb,wind=wx["Tamb"],wx["wind"]; wxts=wx["ts"]
             fv=fmu_step(G,Tamb,wind)
-            ts_pv=wxts if wxts.tzinfo else wxts.tz_localize(SITE["timezone"])
+            # ✅ Garde pour timestamp invalide
+            if pd.isna(wxts):
+                time.sleep(spd)
+                st.rerun()
+            ts_pv = wxts if wxts.tzinfo else wxts.tz_localize(SITE["timezone"])
             Ppl=pvlib_step_rt(G,DHI,DNI,Tamb,wind,ts_pv)
             # historique
             h=st.session_state
@@ -690,7 +729,6 @@ if menu == "⚡ FMU Temps Réel":
             ph_g2.plotly_chart(f2,use_container_width=True,config=FMU_CFG)
 
             # graphe qualité
-            from plotly.subplots import make_subplots
             f3=make_subplots(rows=2,cols=1,shared_xaxes=True,subplot_titles=("THD [%]","Rendement [%]"),vertical_spacing=0.1)
             f3.update_layout(height=265,**FMU_BG,margin=FMU_MAR,legend=FMU_LEG,font=FMU_FNT,
                 title=dict(text="Qualité onduleur",font=dict(size=10,color="#2d4060"),x=0.01,y=.97))
@@ -984,9 +1022,21 @@ elif menu=="Installation":
     st.markdown("---")
     ia,ib=st.columns(2)
     with ia:
-        st.markdown(f'<div class="spec-block"><div class="spec-block-header">Site & Generale</div><table class="spec-table"><tr><td>Localisation</td><td>Mohammedia, Maroc</td></tr><tr><td>Latitude</td><td><span class="highlight-value">{SITE["lat"]} N</span></td></tr><tr><td>Longitude</td><td><span class="highlight-value">{abs(SITE["lon"])} W</span></td></tr><tr><td>Altitude</td><td>{SITE["altitude"]} m</td></tr><tr><td>Mise en service</td><td>{SITE["commissioning_date"]}</td></tr><tr><td>Operateur</td><td>{SITE["operator"]}</td></tr></table></div>',unsafe_allow_html=True)
+        st.markdown(f'<div class="spec-block"><div class="spec-block-header">Site & Generale</div><table class="spec-table"><tr><td style="padding:10px 14px;color:#6B7585;font-family:"Space Mono",monospace;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;width:50%;border-bottom:1px solid #252A35;">Localisation</td><td style="padding:10px 14px;color:#E8EDF5;font-weight:500;text-align:right;border-bottom:1px solid #252A35;">Mohammedia, Maroc</td></tr>
+        <tr><td style="padding:10px 14px;color:#6B7585;font-family:"Space Mono",monospace;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;width:50%;border-bottom:1px solid #252A35;">Latitude</td><td style="padding:10px 14px;color:#E8EDF5;font-weight:500;text-align:right;border-bottom:1px solid #252A35;"><span class="highlight-value">{SITE["lat"]} N</span></td></tr>
+        <tr><td style="padding:10px 14px;color:#6B7585;font-family:"Space Mono",monospace;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;width:50%;border-bottom:1px solid #252A35;">Longitude</td><td style="padding:10px 14px;color:#E8EDF5;font-weight:500;text-align:right;border-bottom:1px solid #252A35;"><span class="highlight-value">{abs(SITE["lon"])} W</span></td></tr>
+        <tr><td style="padding:10px 14px;color:#6B7585;font-family:"Space Mono",monospace;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;width:50%;border-bottom:1px solid #252A35;">Altitude</td><td style="padding:10px 14px;color:#E8EDF5;font-weight:500;text-align:right;border-bottom:1px solid #252A35;">{SITE["altitude"]} m</td></tr>
+        <tr><td style="padding:10px 14px;color:#6B7585;font-family:"Space Mono",monospace;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;width:50%;border-bottom:1px solid #252A35;">Mise en service</td><td style="padding:10px 14px;color:#E8EDF5;font-weight:500;text-align:right;border-bottom:1px solid #252A35;">{SITE["commissioning_date"]}</td></tr>
+        <tr><td style="padding:10px 14px;color:#6B7585;font-family:"Space Mono",monospace;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;width:50%;">Operateur</td><td style="padding:10px 14px;color:#E8EDF5;font-weight:500;text-align:right;">{SITE["operator"]}</td></tr>
+        </table></div>',unsafe_allow_html=True)
     with ib:
-        st.markdown(f'<div class="spec-block"><div class="spec-block-header">Panneau PV</div><table class="spec-table"><tr><td>Fabricant</td><td>{PANEL["manufacturer"]}</td></tr><tr><td>Modele</td><td>{PANEL["model"]}</td></tr><tr><td>Pmax</td><td><span class="highlight-value">{PANEL["pdc0"]} Wc</span></td></tr><tr><td>Vmp / Imp</td><td>{PANEL["vmp"]} V / {PANEL["imp"]} A</td></tr><tr><td>Voc / Isc</td><td>{PANEL["voc"]} V / {PANEL["isc"]} A</td></tr><tr><td>Rendement</td><td><span class="highlight-value">{PANEL["efficiency_pct"]} %</span></td></tr></table></div>',unsafe_allow_html=True)
+        st.markdown(f'<div class="spec-block"><div class="spec-block-header">Panneau PV</div><table class="spec-table"><tr><td style="padding:10px 14px;color:#6B7585;font-family:"Space Mono",monospace;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;width:50%;border-bottom:1px solid #252A35;">Fabricant</td><td style="padding:10px 14px;color:#E8EDF5;font-weight:500;text-align:right;border-bottom:1px solid #252A35;">{PANEL["manufacturer"]}</td></tr>
+        <tr><td style="padding:10px 14px;color:#6B7585;font-family:"Space Mono",monospace;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;width:50%;border-bottom:1px solid #252A35;">Modele</td><td style="padding:10px 14px;color:#E8EDF5;font-weight:500;text-align:right;border-bottom:1px solid #252A35;">{PANEL["model"]}</td></tr>
+        <tr><td style="padding:10px 14px;color:#6B7585;font-family:"Space Mono",monospace;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;width:50%;border-bottom:1px solid #252A35;">Pmax</td><td style="padding:10px 14px;color:#E8EDF5;font-weight:500;text-align:right;border-bottom:1px solid #252A35;"><span class="highlight-value">{PANEL["pdc0"]} Wc</span></td></tr>
+        <tr><td style="padding:10px 14px;color:#6B7585;font-family:"Space Mono",monospace;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;width:50%;border-bottom:1px solid #252A35;">Vmp / Imp</td><td style="padding:10px 14px;color:#E8EDF5;font-weight:500;text-align:right;border-bottom:1px solid #252A35;">{PANEL["vmp"]} V / {PANEL["imp"]} A</td></tr>
+        <tr><td style="padding:10px 14px;color:#6B7585;font-family:"Space Mono",monospace;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;width:50%;border-bottom:1px solid #252A35;">Voc / Isc</td><td style="padding:10px 14px;color:#E8EDF5;font-weight:500;text-align:right;border-bottom:1px solid #252A35;">{PANEL["voc"]} V / {PANEL["isc"]} A</td></tr>
+        <tr><td style="padding:10px 14px;color:#6B7585;font-family:"Space Mono",monospace;font-size:11px;text-transform:uppercase;letter-spacing:0.08em;width:50%;">Rendement</td><td style="padding:10px 14px;color:#E8EDF5;font-weight:500;text-align:right;"><span class="highlight-value">{PANEL["efficiency_pct"]} %</span></td></tr>
+        </table></div>',unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════════
 # CONTROLE RELAIS
@@ -997,15 +1047,18 @@ elif menu=="Controle Relais":
     if dc: st.success("ESP32 connecte a Blynk")
     else: st.warning("ESP32 non connecte")
     rs=blynk_get_pin(BLYNK_CONFIG["relay_pin"])
+    # ✅ Affichage correct
+    is_relay_active = rs == 1
     rc1,rc2,rc3=st.columns(3)
     with rc1:
-        col="#2ECC71" if rs==1 else "#E74C3C"
-        st.markdown(f'<div class="metric-card"><div class="metric-label">ETAT RELAIS</div><div class="metric-value" style="color:{col}">{"ACTIF" if rs==1 else "INACTIF"}</div></div>',unsafe_allow_html=True)
+        col="#2ECC71" if is_relay_active else "#E74C3C"
+        st.markdown(f'<div class="metric-card"><div class="metric-label">ETAT RELAIS</div><div class="metric-value" style="color:{col}">{"ACTIF" if is_relay_active else "INACTIF"}</div></div>',unsafe_allow_html=True)
     with rc2:
         st.markdown(f'<div class="metric-card"><div class="metric-label">PIN BLYNK</div><div class="metric-value">{BLYNK_CONFIG["relay_pin"]}</div></div>',unsafe_allow_html=True)
     with rc3:
         col2="#2ECC71" if dc else "#E74C3C"
-        st.markdown(f'<div class="metric-card"><div class="metric-label">CONNEXION</div><div class="metric-value" style="color:{col2}">{"FAR" if dc else "HORS LIGNE"}</div></div>',unsafe_allow_html=True)
+        # ✅ Correction : "FAR" → "EN LIGNE"
+        st.markdown(f'<div class="metric-card"><div class="metric-label">CONNEXION</div><div class="metric-value" style="color:{col2}">{"EN LIGNE" if dc else "HORS LIGNE"}</div></div>',unsafe_allow_html=True)
     st.markdown("---")
     rb1,rb2,rb3=st.columns(3)
     with rb1:
